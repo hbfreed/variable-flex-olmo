@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# uv lockfile
+uv.lock
+
+# Claude Code
+.claude
+
+# Environment variables
+.env
+.env.*
+
+# Linter/type checker caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
