@@ -24,5 +24,6 @@ uv.lock
 .ruff_cache/
 .pytest_cache/
 
-# PyTorch files
+# big files
 *.pt
+*.safetensors

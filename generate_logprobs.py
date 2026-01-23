@@ -13,7 +13,6 @@ from flexolmo_adapter import FlexOlmoAdapter
 
 model_name = "allenai/Flex-math-2x7B-1T"
 dataset_path = "allenai/dolmino-mix-1124"
-output_file = "flex_math_logprobs.jsonl"
 cache_file = "tokenized_chunks.pt"
 compile = True
 batch_size = 7
@@ -186,7 +185,9 @@ def main():
     # Arrow list columns use 32-bit offsets and ~2GB buffers; cap rows per shard to avoid overflow.
     per_row_topk = chunk_size * TOP_K
     max_rows_by_elements = (2**31 - 1) // per_row_topk
-    max_rows_by_bytes = (2**31 - 1) // (per_row_topk * 4)  # int32 topk_indices is the tightest column
+    max_rows_by_bytes = (2**31 - 1) // (
+        per_row_topk * 4
+    )  # int32 topk_indices is the tightest column
     rows_per_shard = max(1, min(max_rows_by_elements, max_rows_by_bytes))
 
     for batch_start in tqdm(
