@@ -17,4 +17,5 @@ dependencies = [
     "transformers>=4.57.3",
     "wandb>=0.23.1",
     "zstandard>=0.25.0",
+    "lm-eval[api,math]>=0.4.9.2",
 ]

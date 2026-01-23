@@ -27,3 +27,9 @@ uv.lock
 # big files
 *.pt
 *.safetensors
+
+# model artifacts and outputs
+pruned_models/
+checkpoints/
+results/
+wandb/

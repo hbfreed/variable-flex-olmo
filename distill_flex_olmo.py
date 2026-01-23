@@ -1,13 +1,13 @@
 """Distilling training loop with resume support and full state saving.
 
-Expects a model with SplitFlexOlmoExperts (from prune_flex_olmo.py) where:
+Expects a pruned model (from prune_flex_olmo.py) where:
 - Expert 0 is frozen (requires_grad=False)
 - Expert 1 is trainable (pruned to target width)
 
-Only expert 1's parameters are passed to the optimizer, saving ~25GB
-(no gradients/optimizer states for the 4.3B frozen expert 0).
+Only expert 1's parameters are passed to the optimizer.
 """
 
+import argparse
 import json
 import os
 import random
@@ -20,27 +20,26 @@ import wandb
 from datasets import load_dataset
 from huggingface_hub import HfApi, hf_hub_download
 from liger_kernel.transformers import LigerKLDIVLoss
-from transformers import AutoModelForCausalLM
 from tqdm import tqdm
 from transformers import AutoTokenizer
+
+from prune_flex_olmo import load_pruned_model, save_pruned_model, TOKENIZER_NAME
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
 
 # Model config
-width = 2048
-TEACHER = "allenai/Flex-math-2x7B-1T"
-BASE_MODEL = f"hbfreed/flex-math-pruned-{width}"
-HUB_REPO = f"hbfreed/flex-math-pruned-{width}"
+WIDTHS = [8192, 5504, 2048]
+IMPORTANCE_TYPES = ["math", "general"]
 
 # Data config
 LOGPROBS_DATASET = "hbfreed/flexolmo-math-logprobs"
-SEQ_LEN = 4096  # from generate_logprobs.py chunk_size
+SEQ_LEN = 4096
 TOP_K = 128  # from generate_logprobs.py
 
 # Training config
-batch_size = 8
+batch_size = 4
 n_epochs = 1
 val_split = 0.02  # fraction of data for validation
 wandb_project = "flex-olmo-distillation"
@@ -51,36 +50,36 @@ torch.manual_seed(1223)
 
 
 def load_logprobs_dataset():
-    """Load logprobs from HuggingFace and convert to training format."""
+    """Load logprobs from HuggingFace, keeping as memory-mapped Dataset."""
+    from datasets import concatenate_datasets
     print(f"Loading dataset from {LOGPROBS_DATASET}...")
 
     # Load all splits (train_0, train_1, etc.)
     ds = load_dataset(LOGPROBS_DATASET)
 
-    # Concatenate all splits
-    all_data = []
+    # Concatenate all splits into single Dataset (stays memory-mapped)
+    splits = []
     for split_name in sorted(ds.keys()):
         print(f"  Loading {split_name}: {len(ds[split_name])} sequences")
-        all_data.extend(ds[split_name])
+        splits.append(ds[split_name])
 
-    print(f"Total sequences: {len(all_data)}")
-    return all_data
+    combined = concatenate_datasets(splits)
+    print(f"Total sequences: {len(combined)}")
+    return combined
 
 
-def convert_to_training_format(examples):
-    """Convert HF dataset format to training batch format.
+def convert_batch_to_tensors(batch):
+    """Convert HF batch dict to training tensors.
 
-    From: input_ids, topk_indices, topk_logprobs
-    To: input_ids, position_ids, teacher_indices, teacher_logits, pad_mask
+    From: input_ids, topk_indices, topk_logprobs (lists)
+    To: input_ids, position_ids, teacher_indices, teacher_logits, pad_mask (tensors)
     """
-    batch_size = len(examples)
-    seq_len = len(examples[0]["input_ids"])
-
-    input_ids = torch.tensor([ex["input_ids"] for ex in examples])
-    position_ids = torch.arange(seq_len).unsqueeze(0).expand(batch_size, -1)
-    teacher_indices = torch.tensor([ex["topk_indices"] for ex in examples])
-    teacher_logits = torch.tensor([ex["topk_logprobs"] for ex in examples])
-    pad_mask = torch.ones(batch_size, seq_len, dtype=torch.bool)  # no padding
+    input_ids = torch.tensor(batch["input_ids"])
+    bs, seq_len = input_ids.shape
+    position_ids = torch.arange(seq_len).unsqueeze(0).expand(bs, -1)
+    teacher_indices = torch.tensor(batch["topk_indices"])
+    teacher_logits = torch.tensor(batch["topk_logprobs"])
+    pad_mask = torch.ones(bs, seq_len, dtype=torch.bool)
 
     return {
         "input_ids": input_ids,
@@ -91,19 +90,15 @@ def convert_to_training_format(examples):
     }
 
 
-def create_batches(data, batch_size, shuffle=False, seed=None):
-    """Create batches from list of examples."""
+def iterate_batches(dataset, batch_size, shuffle=False, seed=None):
+    """Yield batches from HF Dataset without loading all into memory."""
     if shuffle:
-        rng = random.Random(seed)
-        data = data.copy()
-        rng.shuffle(data)
+        dataset = dataset.shuffle(seed=seed)
 
-    batches = []
-    for i in range(0, len(data), batch_size):
-        batch_examples = data[i:i + batch_size]
-        if len(batch_examples) == batch_size:  # drop incomplete batch
-            batches.append(convert_to_training_format(batch_examples))
-    return batches
+    for i in range(0, len(dataset), batch_size):
+        batch = dataset[i:i + batch_size]
+        if len(batch["input_ids"]) == batch_size:  # drop incomplete batch
+            yield convert_batch_to_tensors(batch)
 
 
 def move_batch_to_device(batch, device):
@@ -134,15 +129,15 @@ def eval_model(student, val_batches, kld_loss, device):
     return val_loss / len(val_batches)
 
 
-def push_checkpoint(student, tokenizer, optimizer, scheduler, global_step, repo_id):
-    """Save model + training state to RAM, upload to HF, cleanup."""
-    if os.path.exists(TMP_CHECKPOINT):
-        shutil.rmtree(TMP_CHECKPOINT)
-    os.makedirs(TMP_CHECKPOINT)
+def save_checkpoint(student, optimizer, scheduler, global_step, checkpoint_dir,
+                    importance_type, expert_1_width, push_to_hub=False, hub_repo=None):
+    """Save model + training state locally, optionally push to HF."""
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-    student.save_pretrained(TMP_CHECKPOINT)
-    tokenizer.save_pretrained(TMP_CHECKPOINT)
+    # Save model weights
+    save_pruned_model(student, checkpoint_dir, importance_type, expert_1_width)
 
+    # Save training state
     training_state = {
         "step": global_step,
         "optimizer": optimizer.state_dict(),
@@ -151,71 +146,109 @@ def push_checkpoint(student, tokenizer, optimizer, scheduler, global_step, repo_
         "cuda_rng_state": torch.cuda.get_rng_state(),
         "python_rng_state": random.getstate(),
     }
-    torch.save(training_state, os.path.join(TMP_CHECKPOINT, "training_state.pt"))
+    torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
 
-    with open(os.path.join(TMP_CHECKPOINT, "checkpoint_info.json"), "w") as f:
+    with open(os.path.join(checkpoint_dir, "checkpoint_info.json"), "w") as f:
         json.dump({"step": global_step}, f)
 
-    api = HfApi()
-    api.upload_folder(
-        folder_path=TMP_CHECKPOINT,
-        repo_id=repo_id,
-        repo_type="model",
-        commit_message=f"step_{global_step}",
-    )
-    shutil.rmtree(TMP_CHECKPOINT)
+    print(f"Saved checkpoint at step {global_step} to {checkpoint_dir}")
+
+    if push_to_hub and hub_repo:
+        api = HfApi()
+        api.upload_folder(
+            folder_path=checkpoint_dir,
+            repo_id=hub_repo,
+            repo_type="model",
+            commit_message=f"step_{global_step}",
+        )
+        print(f"Pushed to {hub_repo}")
 
 
-def load_resume_state(repo_id):
-    """Try to load training state from HF repo. Returns (step, state_dict) or (0, None)."""
-    try:
-        info_path = hf_hub_download(repo_id, "checkpoint_info.json")
-        with open(info_path) as f:
-            info = json.load(f)
+def load_checkpoint(checkpoint_dir):
+    """Load training state from local checkpoint. Returns (step, state) or (0, None)."""
+    info_path = os.path.join(checkpoint_dir, "checkpoint_info.json")
+    state_path = os.path.join(checkpoint_dir, "training_state.pt")
 
-        state_path = hf_hub_download(repo_id, "training_state.pt")
-        state = torch.load(state_path, map_location="cpu", weights_only=False)
-
-        print(f"Found checkpoint at step {info['step']}")
-        return info["step"], state
-    except Exception as e:
-        print(f"No checkpoint found or error loading: {e}")
+    if not os.path.exists(info_path) or not os.path.exists(state_path):
         return 0, None
+
+    with open(info_path) as f:
+        info = json.load(f)
+
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    print(f"Found checkpoint at step {info['step']}")
+    return info["step"], state
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Distill pruned FlexOlmo")
+    parser.add_argument(
+        "--importance", "-i",
+        choices=IMPORTANCE_TYPES,
+        required=True,
+        help="Which importance scores were used for pruning"
+    )
+    parser.add_argument(
+        "--width", "-w",
+        type=int,
+        choices=WIDTHS,
+        required=True,
+        help=f"Expert 1 width. Choices: {WIDTHS}"
+    )
+    parser.add_argument(
+        "--push-to-hub",
+        action="store_true",
+        help="Push checkpoints to HuggingFace Hub (default: local only)"
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Debug mode: overfit on 10 batches"
+    )
+    return parser.parse_args()
 
 
 def main():
-    # Load data from HuggingFace
-    all_data = load_logprobs_dataset()
+    args = parse_args()
 
-    # Split into train/val
-    random.seed(1223)
-    random.shuffle(all_data)
-    val_size = int(len(all_data) * val_split)
-    val_data = all_data[:val_size]
-    train_data = all_data[val_size:]
+    model_path = f"pruned_models/flex_{args.importance}_{args.width}"
+    checkpoint_dir = f"checkpoints/flex_{args.importance}_{args.width}"
+    hub_repo = f"hbfreed/flex-{args.importance}-{args.width}"
+
+    # Check for existing checkpoint
+    resume_step, resume_state = load_checkpoint(checkpoint_dir)
+
+    # Load data from HuggingFace (memory-mapped)
+    dataset = load_logprobs_dataset()
+
+    # Split into train/val using HF Dataset's method
+    split = dataset.train_test_split(test_size=val_split, seed=1223)
+    train_data = split["train"]
+    val_data = split["test"]
 
     print(f"Train sequences: {len(train_data)}")
     print(f"Val sequences: {len(val_data)}")
 
-    # Create validation batches (fixed)
-    val_batches = create_batches(val_data, batch_size)
+    # Debug mode: overfit on 10 batches
+    if args.debug:
+        print("\n*** DEBUG MODE: overfitting on 10 batches ***\n")
+        train_data = train_data.select(range(min(10 * batch_size, len(train_data))))
+        val_data = val_data.select(range(min(batch_size, len(val_data))))
+
+    # Create validation batches (small enough to keep in memory)
+    val_batches = list(iterate_batches(val_data, batch_size))
     print(f"Val batches: {len(val_batches)}")
 
     # Calculate training steps
     steps_per_epoch = len(train_data) // batch_size
-    total_steps = steps_per_epoch * n_epochs
-    eval_every = max(1, int(total_steps * 0.1))
-    save_every = max(1, min(500, int(total_steps * 0.02)))
-
-    # Check for existing checkpoint
-    resume_step, resume_state = load_resume_state(HUB_REPO)
-
-    if resume_step > 0:
-        print(f"Resuming from step {resume_step}")
-        STUDENT = HUB_REPO
+    if args.debug:
+        n_epochs_actual = 10  # 10 passes over 10 batches = 100 steps
+        total_steps = steps_per_epoch * n_epochs_actual
     else:
-        print("Starting fresh")
-        STUDENT = BASE_MODEL
+        n_epochs_actual = n_epochs
+        total_steps = steps_per_epoch * n_epochs_actual
+    eval_every = max(1, int(total_steps * 0.1))
+    save_every = max(1, min(500, int(total_steps * 0.5))) if args.debug else max(1, min(1000, int(total_steps * 0.05)))
 
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Total steps: {total_steps}")
@@ -224,12 +257,15 @@ def main():
     print(f"Eval every: {eval_every} steps")
     print(f"Save every: {save_every} steps")
 
-    # Load model
-    print(f"Loading student model from {STUDENT}...")
-    tokenizer = AutoTokenizer.from_pretrained(STUDENT)
-    student = AutoModelForCausalLM.from_pretrained(
-        STUDENT, torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2"
-    ).to(device)
+    # Load model (from checkpoint if resuming, otherwise from pruned model)
+    if resume_step > 0:
+        print(f"Resuming from checkpoint at step {resume_step}...")
+        student = load_pruned_model(checkpoint_dir, device=device)
+    else:
+        print(f"Loading student model from {model_path}...")
+        student = load_pruned_model(model_path, device=device)
+
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
     # Only optimize trainable params (expert 1)
     trainable_params = [p for p in student.parameters() if p.requires_grad]
@@ -240,7 +276,7 @@ def main():
         optimizer, T_max=total_steps, eta_min=4.5e-7
     )
 
-    # Restore state if resuming
+    # Restore optimizer/scheduler state if resuming
     if resume_state is not None:
         print("Restoring optimizer and scheduler state...")
         optimizer.load_state_dict(resume_state["optimizer"])
@@ -248,43 +284,44 @@ def main():
         torch.set_rng_state(resume_state["rng_state"])
         torch.cuda.set_rng_state(resume_state["cuda_rng_state"])
         random.setstate(resume_state["python_rng_state"])
-    else:
-        for _ in range(resume_step):
-            scheduler.step()
 
     kld_loss = LigerKLDIVLoss(log_target=True)
 
     wandb.init(
         project=wandb_project,
+        mode="offline" if args.debug else "online",
         config={
-            "teacher": TEACHER,
-            "student": STUDENT,
+            "importance": args.importance,
+            "width": args.width,
+            "model_path": model_path,
             "seq_len": SEQ_LEN,
             "batch_size": batch_size,
             "steps_per_epoch": steps_per_epoch,
-            "n_epochs": n_epochs,
+            "n_epochs": n_epochs_actual,
             "total_steps": total_steps,
             "resume_step": resume_step,
             "lr_start": 2e-4,
             "lr_end": 4.5e-7,
+            "debug": args.debug,
         },
         resume="allow",
     )
 
-    # Create HF repo if needed
-    api = HfApi()
-    try:
-        api.create_repo(HUB_REPO, exist_ok=True)
-    except Exception as e:
-        print(f"Repo creation note: {e}")
+    # Create HF repo if pushing
+    if args.push_to_hub:
+        api = HfApi()
+        try:
+            api.create_repo(hub_repo, exist_ok=True)
+        except Exception as e:
+            print(f"Repo creation note: {e}")
 
     # Training loop
     global_step = 0
-    for epoch in range(n_epochs):
-        # Shuffle and batch training data each epoch
-        train_batches = create_batches(train_data, batch_size, shuffle=True, seed=1223 + epoch)
+    for epoch in range(n_epochs_actual):
+        # Iterate through shuffled batches (memory-efficient)
+        train_iter = iterate_batches(train_data, batch_size, shuffle=True, seed=1223 + epoch)
 
-        pbar = tqdm(train_batches, desc=f"Epoch {epoch + 1}/{n_epochs}")
+        pbar = tqdm(train_iter, total=steps_per_epoch, desc=f"Epoch {epoch + 1}/{n_epochs_actual}")
         for batch in pbar:
             # Skip to resume point
             if global_step < resume_step:
@@ -328,8 +365,10 @@ def main():
             pbar.set_postfix(loss=f"{loss.item():.4f}", toks=f"{throughput:.0f}")
 
             if (global_step + 1) % save_every == 0:
-                print(f"\nPushing checkpoint at step {global_step} to {HUB_REPO}...")
-                push_checkpoint(student, tokenizer, optimizer, scheduler, global_step, HUB_REPO)
+                save_checkpoint(
+                    student, optimizer, scheduler, global_step, checkpoint_dir,
+                    args.importance, args.width, args.push_to_hub, hub_repo
+                )
 
             if (global_step + 1) % eval_every == 0:
                 val_loss = eval_model(student, val_batches, kld_loss, device)
@@ -338,9 +377,11 @@ def main():
 
             global_step += 1
 
-    # Final push
-    print(f"\nPushing final model to {HUB_REPO}...")
-    push_checkpoint(student, tokenizer, optimizer, scheduler, global_step, HUB_REPO)
+    # Final save
+    save_checkpoint(
+        student, optimizer, scheduler, global_step, checkpoint_dir,
+        args.importance, args.width, args.push_to_hub, hub_repo
+    )
 
     wandb.finish()
     print("Done!")

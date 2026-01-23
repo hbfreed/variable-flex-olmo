@@ -3,7 +3,6 @@ from itertools import chain
 from pathlib import Path
 
 import torch
-import torch.nn.functional as F
 from datasets import load_dataset
 from safetensors.torch import load_file, save_file
 from tqdm import tqdm
@@ -16,6 +15,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 MODEL = "allenai/Flex-math-2x7B-1T"
+TOKENIZER_NAME = "allenai/dolma2-tokenizer"
 EXPERT_IDX = 1  # expert 0 is base/public, expert 1 is math-specialized
 
 
@@ -48,8 +48,8 @@ DATASETS = {
     },
     "general": {
         "data_files": [
-            "data/flan/**/*.jsonl",
-            "data/wiki/**/*.jsonl",
+            "data/flan/**/*.json.gz",
+            "data/wiki/**/*.json.gz",
         ],
         "cache_path": "cached_analysis_tokens_general.safetensors",
         "output_path": "importance_scores_tensors/importance_scores_general.safetensors",
@@ -58,13 +58,12 @@ DATASETS = {
 
 sequence_length = 4096  # same seq_len as pretraining
 num_samples = 1024  # specified in the nvidia paper
-batch_size = 7  # adjust for hardware
+batch_size = 8  # adjust for hardware
 
 
-def get_dataset(data_files):
+def get_dataset():
     ds = load_dataset(
         "allenai/dolmino-mix-1124",
-        data_files=data_files,
         split="train",
         streaming=True,
     ).shuffle(buffer_size=50_000, seed=1223)
@@ -72,7 +71,7 @@ def get_dataset(data_files):
 
 
 def tokenize_dataset(dataset):
-    tokenizer = AutoTokenizer.from_pretrained(MODEL)
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
     texts = [sample["text"] for sample in dataset]
     tokenized = tokenizer(
         texts, padding=False, truncation=False, add_special_tokens=False
@@ -80,43 +79,23 @@ def tokenize_dataset(dataset):
     return list(chain.from_iterable(tokenized["input_ids"]))
 
 
-def make_capturing_forward(layer_idx, importance_dict, target_expert=EXPERT_IDX):
-    """Create a patched FlexOlmoExperts.forward that captures target expert's activations.
+def make_capturing_forward(layer_idx, importance_dict):
+    """Create a patched FlexOlmoMLP.forward that captures intermediate activations."""
 
-    FlexOlmoExperts uses fused weights (gate_up_proj, down_proj) with shape [num_experts, ...],
-    so we can't use hooks on individual experts. Instead we patch the forward method.
-    """
+    def patched_forward(self, x):
+        # Compute intermediate activation (before down_proj)
+        intermediate = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
 
-    def patched_forward(self, hidden_states, top_k_index, top_k_weights):
-        final_hidden_states = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            expert_mask = F.one_hot(top_k_index, num_classes=self.num_experts)
-            expert_mask = expert_mask.permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
+        # Capture importance: mean over tokens, squared (L2 norm component)
+        importance = intermediate.detach().abs().mean(dim=0).pow(2).cpu()
+        name = f"layer_{layer_idx}.mlp"
+        if name in importance_dict:
+            importance_dict[name] += importance
+        else:
+            importance_dict[name] = importance
 
-        for expert_idx in expert_hit:
-            expert_idx_val = expert_idx[0].item()
-            if expert_idx_val == self.num_experts:
-                continue
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx_val])
-            current_state = hidden_states[token_idx]
-            gate, up = F.linear(current_state, self.gate_up_proj[expert_idx_val]).chunk(2, dim=-1)
-            current_hidden_states = self.act_fn(gate) * up
-
-            # Capture target expert's pre-down_proj activations
-            if expert_idx_val == target_expert:
-                x = current_hidden_states.detach().abs().mean(dim=0).pow(2).cpu()
-                name = f"layer_{layer_idx}.mlp"
-                if name in importance_dict:
-                    importance_dict[name] += x
-                else:
-                    importance_dict[name] = x
-
-            current_hidden_states = F.linear(current_hidden_states, self.down_proj[expert_idx_val])
-            current_hidden_states = current_hidden_states * top_k_weights[token_idx, top_k_pos, None]
-            final_hidden_states.index_add_(0, token_idx, current_hidden_states.to(final_hidden_states.dtype))
-
-        return final_hidden_states
+        # Continue with normal forward
+        return self.down_proj(intermediate)
 
     return patched_forward
 
@@ -127,7 +106,7 @@ def load_or_cache_tokens(config):
     if Path(cache_path).exists():
         return load_file(cache_path)["tokens"]
 
-    dataset = tokenize_dataset(get_dataset(config["data_files"]))
+    dataset = tokenize_dataset(get_dataset())
     total_tokens = sequence_length * num_samples
     all_tokens = torch.tensor(dataset[:total_tokens]).view(num_samples, sequence_length)
     save_file({"tokens": all_tokens}, cache_path)
@@ -139,13 +118,13 @@ def run_analysis(model, config, all_tokens, importance_dict):
     num_hidden_layers = model.config.num_hidden_layers
     intermediate_size = model.config.intermediate_size
 
-    # Patch experts forward to capture activations
+    # Patch expert 1's forward to capture activations
     original_forwards = []
     for i, layer in enumerate(model.model.layers):
-        experts = layer.mlp.experts
-        original_forwards.append(experts.forward)
-        experts.forward = types.MethodType(
-            make_capturing_forward(i, importance_dict), experts
+        expert = layer.mlp.experts[EXPERT_IDX]
+        original_forwards.append(expert.forward)
+        expert.forward = types.MethodType(
+            make_capturing_forward(i, importance_dict), expert
         )
 
     # Run forward passes (input goes to cuda:0 where embed_tokens lives)
@@ -158,7 +137,7 @@ def run_analysis(model, config, all_tokens, importance_dict):
 
     # Restore original forwards
     for i, layer in enumerate(model.model.layers):
-        layer.mlp.experts.forward = original_forwards[i]
+        layer.mlp.experts[EXPERT_IDX].forward = original_forwards[i]
 
     # Finish L2 norm (sqrt) and assemble into tensor (all on CPU)
     mlp_importance = torch.zeros(num_hidden_layers, intermediate_size)
@@ -178,7 +157,7 @@ def main():
     device_map = get_device_map()
     model = AutoModelForCausalLM.from_pretrained(
         MODEL,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
         device_map=device_map,
     )
@@ -187,6 +166,10 @@ def main():
         print(f"\n{'=' * 60}")
         print(f"Running analysis for: {dataset_name}")
         print(f"{'=' * 60}")
+
+        if Path(config["output_path"]).exists():
+            print(f"Skipping {dataset_name} - importance scores already exist at {config['output_path']}")
+            continue
 
         all_tokens = load_or_cache_tokens(config)
         importance_dict = {}  # fresh dict for each dataset
