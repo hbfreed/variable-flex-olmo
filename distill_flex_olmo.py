@@ -11,19 +11,18 @@ import argparse
 import json
 import os
 import random
-import shutil
 import time
 
 import torch
 import torch.nn.functional as F
-import wandb
 from datasets import load_dataset
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi
 from liger_kernel.transformers import LigerKLDIVLoss
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from prune_flex_olmo import load_pruned_model, save_pruned_model, TOKENIZER_NAME
+import wandb
+from prune_flex_olmo import TOKENIZER_NAME, load_pruned_model, save_pruned_model
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -39,19 +38,115 @@ SEQ_LEN = 4096
 TOP_K = 128  # from generate_logprobs.py
 
 # Training config
-batch_size = 4
+DEFAULT_BATCH_SIZE = 4
 n_epochs = 1
 val_split = 0.02  # fraction of data for validation
 wandb_project = "flex-olmo-distillation"
 TMP_CHECKPOINT = "/dev/shm/checkpoint_tmp"
+BATCH_SIZE_CACHE = "batch_size_cache.json"
 
 device = "cuda"
 torch.manual_seed(1223)
 
 
+def load_batch_size_cache():
+    """Load cached batch sizes from disk."""
+    if os.path.exists(BATCH_SIZE_CACHE):
+        with open(BATCH_SIZE_CACHE) as f:
+            return json.load(f)
+    return {}
+
+
+def save_batch_size_cache(cache):
+    """Save batch size cache to disk."""
+    with open(BATCH_SIZE_CACHE, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
+def get_cache_key(width):
+    """Generate cache key from GPU name and model width."""
+    gpu_name = torch.cuda.get_device_name(0).replace(" ", "_")
+    return f"{gpu_name}_w{width}"
+
+
+def find_max_batch_size(model, sample_input_ids, min_bs=1, max_bs=64):
+    """Binary search for largest batch size that doesn't OOM.
+
+    Tests forward + backward pass to ensure training will work.
+    """
+    working_bs = min_bs
+    seq_len = sample_input_ids.shape[1]
+
+    print(f"Auto-tuning batch size (range {min_bs}-{max_bs})...")
+
+    while min_bs <= max_bs:
+        mid = (min_bs + max_bs) // 2
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        try:
+            # Create batch of size mid
+            input_ids = sample_input_ids[:1].expand(mid, -1).contiguous().to(device)
+            position_ids = (
+                torch.arange(seq_len, device=device).unsqueeze(0).expand(mid, -1)
+            )
+
+            # Forward pass
+            output = model(input_ids, position_ids=position_ids)
+            loss = output.logits.sum()  # dummy loss
+
+            # Backward pass (critical - this is where OOM often happens)
+            loss.backward()
+            model.zero_grad(set_to_none=True)
+
+            torch.cuda.synchronize()
+
+            peak_mem = torch.cuda.max_memory_allocated() / 1e9
+            total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+            print(f"  batch_size={mid}: OK (peak {peak_mem:.1f}GB / {total_mem:.1f}GB)")
+
+            working_bs = mid
+            min_bs = mid + 1
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"  batch_size={mid}: OOM")
+            torch.cuda.empty_cache()
+            max_bs = mid - 1
+
+    # Add 10% safety margin
+    safe_bs = max(1, int(working_bs * 0.9))
+    print(
+        f"Max working batch size: {working_bs}, using {safe_bs} (with 10% safety margin)"
+    )
+    return safe_bs
+
+
+def get_batch_size(model, width, sample_input_ids, force_autotune=False):
+    """Get batch size from cache or auto-tune if needed."""
+    cache = load_batch_size_cache()
+    cache_key = get_cache_key(width)
+
+    if cache_key in cache and not force_autotune:
+        cached_bs = cache[cache_key]
+        print(f"Using cached batch size: {cached_bs} (key: {cache_key})")
+        return cached_bs
+
+    # Auto-tune
+    print(f"No cached batch size for {cache_key}, auto-tuning...")
+    batch_size = find_max_batch_size(model, sample_input_ids)
+
+    # Cache the result
+    cache[cache_key] = batch_size
+    save_batch_size_cache(cache)
+    print(f"Cached batch size {batch_size} for {cache_key}")
+
+    return batch_size
+
+
 def load_logprobs_dataset():
     """Load logprobs from HuggingFace, keeping as memory-mapped Dataset."""
     from datasets import concatenate_datasets
+
     print(f"Loading dataset from {LOGPROBS_DATASET}...")
 
     # Load all splits (train_0, train_1, etc.)
@@ -96,7 +191,7 @@ def iterate_batches(dataset, batch_size, shuffle=False, seed=None):
         dataset = dataset.shuffle(seed=seed)
 
     for i in range(0, len(dataset), batch_size):
-        batch = dataset[i:i + batch_size]
+        batch = dataset[i : i + batch_size]
         if len(batch["input_ids"]) == batch_size:  # drop incomplete batch
             yield convert_batch_to_tensors(batch)
 
@@ -120,17 +215,32 @@ def eval_model(student, val_batches, kld_loss, device):
                 dim=-1,
             )
             pad_mask = batch["pad_mask"]
-            student_logprobs_at_topk = student_logprobs.gather(-1, batch["teacher_indices"])
+            student_logprobs_at_topk = student_logprobs.gather(
+                -1, batch["teacher_indices"]
+            )
             student_logprobs_at_topk = student_logprobs_at_topk[pad_mask]
             teacher_logits = batch["teacher_logits"][pad_mask]
-            teacher_logprobs = F.log_softmax(teacher_logits.float(), dim=-1).to(teacher_logits.dtype)
-            val_loss += kld_loss(student_logprobs_at_topk.float(), teacher_logprobs.float()).item()
+            teacher_logprobs = F.log_softmax(teacher_logits.float(), dim=-1).to(
+                teacher_logits.dtype
+            )
+            val_loss += kld_loss(
+                student_logprobs_at_topk.float(), teacher_logprobs.float()
+            ).item()
     student.train()
     return val_loss / len(val_batches)
 
 
-def save_checkpoint(student, optimizer, scheduler, global_step, checkpoint_dir,
-                    importance_type, expert_1_width, push_to_hub=False, hub_repo=None):
+def save_checkpoint(
+    student,
+    optimizer,
+    scheduler,
+    global_step,
+    checkpoint_dir,
+    importance_type,
+    expert_1_width,
+    push_to_hub=False,
+    hub_repo=None,
+):
     """Save model + training state locally, optionally push to HF."""
     os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -183,27 +293,39 @@ def load_checkpoint(checkpoint_dir):
 def parse_args():
     parser = argparse.ArgumentParser(description="Distill pruned FlexOlmo")
     parser.add_argument(
-        "--importance", "-i",
+        "--importance",
+        "-i",
         choices=IMPORTANCE_TYPES,
         required=True,
-        help="Which importance scores were used for pruning"
+        help="Which importance scores were used for pruning",
     )
     parser.add_argument(
-        "--width", "-w",
+        "--width",
+        "-w",
         type=int,
         choices=WIDTHS,
         required=True,
-        help=f"Expert 1 width. Choices: {WIDTHS}"
+        help=f"Expert 1 width. Choices: {WIDTHS}",
     )
     parser.add_argument(
         "--push-to-hub",
         action="store_true",
-        help="Push checkpoints to HuggingFace Hub (default: local only)"
+        help="Push checkpoints to HuggingFace Hub (default: local only)",
     )
     parser.add_argument(
-        "--debug",
+        "--debug", action="store_true", help="Debug mode: overfit on 10 batches"
+    )
+    parser.add_argument(
+        "--batch-size",
+        "-b",
+        type=str,
+        default="auto",
+        help="Batch size: 'auto' for auto-tuning (default), or an integer",
+    )
+    parser.add_argument(
+        "--force-autotune",
         action="store_true",
-        help="Debug mode: overfit on 10 batches"
+        help="Force re-run auto-tuning even if cached value exists",
     )
     return parser.parse_args()
 
@@ -229,6 +351,26 @@ def main():
     print(f"Train sequences: {len(train_data)}")
     print(f"Val sequences: {len(val_data)}")
 
+    # Load model (from checkpoint if resuming, otherwise from pruned model)
+    # Must load before batch size determination for auto-tuning
+    if resume_step > 0:
+        print(f"Resuming from checkpoint at step {resume_step}...")
+        student = load_pruned_model(checkpoint_dir, device=device)
+    else:
+        print(f"Loading student model from {model_path}...")
+        student = load_pruned_model(model_path, device=device)
+
+    # Determine batch size
+    if args.batch_size == "auto":
+        # Get a sample input for auto-tuning
+        sample_input = torch.tensor([train_data[0]["input_ids"]])
+        batch_size = get_batch_size(
+            student, args.width, sample_input, force_autotune=args.force_autotune
+        )
+    else:
+        batch_size = int(args.batch_size)
+        print(f"Using manual batch size: {batch_size}")
+
     # Debug mode: overfit on 10 batches
     if args.debug:
         print("\n*** DEBUG MODE: overfitting on 10 batches ***\n")
@@ -248,7 +390,11 @@ def main():
         n_epochs_actual = n_epochs
         total_steps = steps_per_epoch * n_epochs_actual
     eval_every = max(1, int(total_steps * 0.1))
-    save_every = max(1, min(500, int(total_steps * 0.5))) if args.debug else max(1, min(1000, int(total_steps * 0.05)))
+    save_every = (
+        max(1, min(500, int(total_steps * 0.5)))
+        if args.debug
+        else max(1, min(1000, int(total_steps * 0.05)))
+    )
 
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Total steps: {total_steps}")
@@ -257,19 +403,11 @@ def main():
     print(f"Eval every: {eval_every} steps")
     print(f"Save every: {save_every} steps")
 
-    # Load model (from checkpoint if resuming, otherwise from pruned model)
-    if resume_step > 0:
-        print(f"Resuming from checkpoint at step {resume_step}...")
-        student = load_pruned_model(checkpoint_dir, device=device)
-    else:
-        print(f"Loading student model from {model_path}...")
-        student = load_pruned_model(model_path, device=device)
-
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-
     # Only optimize trainable params (expert 1)
     trainable_params = [p for p in student.parameters() if p.requires_grad]
-    print(f"Trainable parameters: {sum(p.numel() for p in trainable_params) / 1e9:.2f}B")
+    print(
+        f"Trainable parameters: {sum(p.numel() for p in trainable_params) / 1e9:.2f}B"
+    )
 
     optimizer = torch.optim.AdamW(trainable_params, lr=2e-4, fused=True)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -319,9 +457,15 @@ def main():
     global_step = 0
     for epoch in range(n_epochs_actual):
         # Iterate through shuffled batches (memory-efficient)
-        train_iter = iterate_batches(train_data, batch_size, shuffle=True, seed=1223 + epoch)
+        train_iter = iterate_batches(
+            train_data, batch_size, shuffle=True, seed=1223 + epoch
+        )
 
-        pbar = tqdm(train_iter, total=steps_per_epoch, desc=f"Epoch {epoch + 1}/{n_epochs_actual}")
+        pbar = tqdm(
+            train_iter,
+            total=steps_per_epoch,
+            desc=f"Epoch {epoch + 1}/{n_epochs_actual}",
+        )
         for batch in pbar:
             # Skip to resume point
             if global_step < resume_step:
@@ -338,10 +482,14 @@ def main():
             )
 
             pad_mask = batch["pad_mask"]
-            student_logprobs_at_topk = student_logprobs.gather(-1, batch["teacher_indices"])
+            student_logprobs_at_topk = student_logprobs.gather(
+                -1, batch["teacher_indices"]
+            )
             student_logprobs_at_topk = student_logprobs_at_topk[pad_mask]
             teacher_logits = batch["teacher_logits"][pad_mask]
-            teacher_logprobs = F.log_softmax(teacher_logits.float(), dim=-1).to(teacher_logits.dtype)
+            teacher_logprobs = F.log_softmax(teacher_logits.float(), dim=-1).to(
+                teacher_logits.dtype
+            )
 
             loss = kld_loss(student_logprobs_at_topk.float(), teacher_logprobs.float())
             loss.backward()
@@ -355,19 +503,28 @@ def main():
             num_tokens = pad_mask.sum().item()
             throughput = num_tokens / step_time
 
-            wandb.log({
-                "train/loss": loss.item(),
-                "train/lr": scheduler.get_last_lr()[0],
-                "train/grad_norm": grad_norm.item(),
-                "train/throughput": throughput,
-                "train/step": global_step,
-            })
+            wandb.log(
+                {
+                    "train/loss": loss.item(),
+                    "train/lr": scheduler.get_last_lr()[0],
+                    "train/grad_norm": grad_norm.item(),
+                    "train/throughput": throughput,
+                    "train/step": global_step,
+                }
+            )
             pbar.set_postfix(loss=f"{loss.item():.4f}", toks=f"{throughput:.0f}")
 
             if (global_step + 1) % save_every == 0:
                 save_checkpoint(
-                    student, optimizer, scheduler, global_step, checkpoint_dir,
-                    args.importance, args.width, args.push_to_hub, hub_repo
+                    student,
+                    optimizer,
+                    scheduler,
+                    global_step,
+                    checkpoint_dir,
+                    args.importance,
+                    args.width,
+                    args.push_to_hub,
+                    hub_repo,
                 )
 
             if (global_step + 1) % eval_every == 0:
@@ -379,8 +536,15 @@ def main():
 
     # Final save
     save_checkpoint(
-        student, optimizer, scheduler, global_step, checkpoint_dir,
-        args.importance, args.width, args.push_to_hub, hub_repo
+        student,
+        optimizer,
+        scheduler,
+        global_step,
+        checkpoint_dir,
+        args.importance,
+        args.width,
+        args.push_to_hub,
+        hub_repo,
     )
 
     wandb.finish()
