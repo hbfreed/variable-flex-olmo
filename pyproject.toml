@@ -19,3 +19,6 @@ dependencies = [
     "zstandard>=0.25.0",
     "lm-eval[api,math]>=0.4.9.2",
 ]
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch"]
