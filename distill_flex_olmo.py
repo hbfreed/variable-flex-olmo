@@ -92,7 +92,7 @@ def collate_fn(batch):
     topk_logprobs = torch.stack([b["topk_logprobs"] for b in batch])
 
     bs, seq_len = input_ids.shape
-    position_ids = torch.arange(seq_len).unsqueeze(0).expand(bs, -1)
+    position_ids = torch.arange(seq_len).unsqueeze(0).expand(bs, -1).contiguous()
     pad_mask = torch.ones(bs, seq_len, dtype=torch.bool)
 
     return {
