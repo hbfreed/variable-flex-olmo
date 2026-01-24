@@ -125,9 +125,22 @@ def save_pruned_model(model, save_path, importance_type, expert_1_width):
 
 
 def load_pruned_model(save_path, device="cuda"):
-    """Load a pruned model by creating matching architecture then loading weights."""
+    """Load a pruned model by creating matching architecture then loading weights.
+
+    If local path doesn't exist, attempts to download from HuggingFace Hub.
+    """
     import json
+    import os
     from safetensors.torch import load_file
+    from huggingface_hub import snapshot_download
+
+    # If local path doesn't exist, try downloading from hub
+    if not os.path.exists(save_path):
+        # Derive hub repo from path: pruned_models/flex_math_2048 -> hbfreed/flex-math-2048
+        model_name = os.path.basename(save_path)  # flex_math_2048
+        repo_id = f"hbfreed/{model_name.replace('_', '-')}"  # hbfreed/flex-math-2048
+        print(f"Local path {save_path} not found, downloading from {repo_id}...")
+        save_path = snapshot_download(repo_id, local_dir=save_path)
 
     # Load metadata
     with open(f"{save_path}/pruning_config.json") as f:
