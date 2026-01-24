@@ -15,13 +15,13 @@ import time
 
 import torch
 import torch.nn.functional as F
+import wandb
 from datasets import load_dataset
 from huggingface_hub import HfApi
 from liger_kernel.transformers import LigerKLDIVLoss
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
-import wandb
 from prune_flex_olmo import TOKENIZER_NAME, load_pruned_model, save_pruned_model
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -38,109 +38,13 @@ SEQ_LEN = 4096
 TOP_K = 128  # from generate_logprobs.py
 
 # Training config
-DEFAULT_BATCH_SIZE = 4
+DEFAULT_BATCH_SIZE = 2
 n_epochs = 1
 val_split = 0.02  # fraction of data for validation
 wandb_project = "flex-olmo-distillation"
-TMP_CHECKPOINT = "/dev/shm/checkpoint_tmp"
-BATCH_SIZE_CACHE = "batch_size_cache.json"
 
 device = "cuda"
 torch.manual_seed(1223)
-
-
-def load_batch_size_cache():
-    """Load cached batch sizes from disk."""
-    if os.path.exists(BATCH_SIZE_CACHE):
-        with open(BATCH_SIZE_CACHE) as f:
-            return json.load(f)
-    return {}
-
-
-def save_batch_size_cache(cache):
-    """Save batch size cache to disk."""
-    with open(BATCH_SIZE_CACHE, "w") as f:
-        json.dump(cache, f, indent=2)
-
-
-def get_cache_key(width):
-    """Generate cache key from GPU name and model width."""
-    gpu_name = torch.cuda.get_device_name(0).replace(" ", "_")
-    return f"{gpu_name}_w{width}"
-
-
-def find_max_batch_size(model, sample_input_ids, min_bs=1, max_bs=64):
-    """Binary search for largest batch size that doesn't OOM.
-
-    Tests forward + backward pass to ensure training will work.
-    """
-    working_bs = min_bs
-    seq_len = sample_input_ids.shape[1]
-
-    print(f"Auto-tuning batch size (range {min_bs}-{max_bs})...")
-
-    while min_bs <= max_bs:
-        mid = (min_bs + max_bs) // 2
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-
-        try:
-            # Create batch of size mid
-            input_ids = sample_input_ids[:1].expand(mid, -1).contiguous().to(device)
-            position_ids = (
-                torch.arange(seq_len, device=device).unsqueeze(0).expand(mid, -1)
-            )
-
-            # Forward pass
-            output = model(input_ids, position_ids=position_ids)
-            loss = output.logits.sum()  # dummy loss
-
-            # Backward pass (critical - this is where OOM often happens)
-            loss.backward()
-            model.zero_grad(set_to_none=True)
-
-            torch.cuda.synchronize()
-
-            peak_mem = torch.cuda.max_memory_allocated() / 1e9
-            total_mem = torch.cuda.get_device_properties(0).total_memory / 1e9
-            print(f"  batch_size={mid}: OK (peak {peak_mem:.1f}GB / {total_mem:.1f}GB)")
-
-            working_bs = mid
-            min_bs = mid + 1
-
-        except torch.cuda.OutOfMemoryError:
-            print(f"  batch_size={mid}: OOM")
-            torch.cuda.empty_cache()
-            max_bs = mid - 1
-
-    # Add 10% safety margin
-    safe_bs = max(1, int(working_bs * 0.9))
-    print(
-        f"Max working batch size: {working_bs}, using {safe_bs} (with 10% safety margin)"
-    )
-    return safe_bs
-
-
-def get_batch_size(model, width, sample_input_ids, force_autotune=False):
-    """Get batch size from cache or auto-tune if needed."""
-    cache = load_batch_size_cache()
-    cache_key = get_cache_key(width)
-
-    if cache_key in cache and not force_autotune:
-        cached_bs = cache[cache_key]
-        print(f"Using cached batch size: {cached_bs} (key: {cache_key})")
-        return cached_bs
-
-    # Auto-tune
-    print(f"No cached batch size for {cache_key}, auto-tuning...")
-    batch_size = find_max_batch_size(model, sample_input_ids)
-
-    # Cache the result
-    cache[cache_key] = batch_size
-    save_batch_size_cache(cache)
-    print(f"Cached batch size {batch_size} for {cache_key}")
-
-    return batch_size
 
 
 def load_logprobs_dataset():
@@ -163,37 +67,41 @@ def load_logprobs_dataset():
     return combined
 
 
-def convert_batch_to_tensors(batch):
-    """Convert HF batch dict to training tensors.
+class LogprobsDataset(Dataset):
+    """PyTorch Dataset wrapper for HF dataset with prefetching support."""
 
-    From: input_ids, topk_indices, topk_logprobs (lists)
-    To: input_ids, position_ids, teacher_indices, teacher_logits, pad_mask (tensors)
-    """
-    input_ids = torch.tensor(batch["input_ids"])
+    def __init__(self, hf_dataset):
+        self.data = hf_dataset
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        return {
+            "input_ids": torch.tensor(item["input_ids"]),
+            "topk_indices": torch.tensor(item["topk_indices"]),
+            "topk_logprobs": torch.tensor(item["topk_logprobs"]),
+        }
+
+
+def collate_fn(batch):
+    """Collate batch items into training tensors."""
+    input_ids = torch.stack([b["input_ids"] for b in batch])
+    topk_indices = torch.stack([b["topk_indices"] for b in batch])
+    topk_logprobs = torch.stack([b["topk_logprobs"] for b in batch])
+
     bs, seq_len = input_ids.shape
     position_ids = torch.arange(seq_len).unsqueeze(0).expand(bs, -1)
-    teacher_indices = torch.tensor(batch["topk_indices"])
-    teacher_logits = torch.tensor(batch["topk_logprobs"])
     pad_mask = torch.ones(bs, seq_len, dtype=torch.bool)
 
     return {
         "input_ids": input_ids,
         "position_ids": position_ids,
-        "teacher_indices": teacher_indices,
-        "teacher_logits": teacher_logits,
+        "teacher_indices": topk_indices,
+        "teacher_logits": topk_logprobs,
         "pad_mask": pad_mask,
     }
-
-
-def iterate_batches(dataset, batch_size, shuffle=False, seed=None):
-    """Yield batches from HF Dataset without loading all into memory."""
-    if shuffle:
-        dataset = dataset.shuffle(seed=seed)
-
-    for i in range(0, len(dataset), batch_size):
-        batch = dataset[i : i + batch_size]
-        if len(batch["input_ids"]) == batch_size:  # drop incomplete batch
-            yield convert_batch_to_tensors(batch)
 
 
 def move_batch_to_device(batch, device):
@@ -204,10 +112,11 @@ def move_batch_to_device(batch, device):
     return batch
 
 
-def eval_model(student, val_batches, kld_loss, device):
+def eval_model(student, val_loader, kld_loss, device):
     student.eval()
     val_loss = 0
-    for batch in val_batches:
+    n_batches = 0
+    for batch in val_loader:
         batch = move_batch_to_device(batch, device)
         with torch.inference_mode():
             student_logprobs = F.log_softmax(
@@ -226,8 +135,9 @@ def eval_model(student, val_batches, kld_loss, device):
             val_loss += kld_loss(
                 student_logprobs_at_topk.float(), teacher_logprobs.float()
             ).item()
+            n_batches += 1
     student.train()
-    return val_loss / len(val_batches)
+    return val_loss / n_batches if n_batches > 0 else 0
 
 
 def save_checkpoint(
@@ -318,20 +228,22 @@ def parse_args():
     parser.add_argument(
         "--batch-size",
         "-b",
-        type=str,
-        default="auto",
-        help="Batch size: 'auto' for auto-tuning (default), or an integer",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Batch size (default: {DEFAULT_BATCH_SIZE})",
     )
     parser.add_argument(
-        "--force-autotune",
-        action="store_true",
-        help="Force re-run auto-tuning even if cached value exists",
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of DataLoader workers for prefetching (default: 4)",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    batch_size = args.batch_size
 
     model_path = f"pruned_models/flex_{args.importance}_{args.width}"
     checkpoint_dir = f"checkpoints/flex_{args.importance}_{args.width}"
@@ -352,7 +264,6 @@ def main():
     print(f"Val sequences: {len(val_data)}")
 
     # Load model (from checkpoint if resuming, otherwise from pruned model)
-    # Must load before batch size determination for auto-tuning
     if resume_step > 0:
         print(f"Resuming from checkpoint at step {resume_step}...")
         student = load_pruned_model(checkpoint_dir, device=device)
@@ -360,16 +271,7 @@ def main():
         print(f"Loading student model from {model_path}...")
         student = load_pruned_model(model_path, device=device)
 
-    # Determine batch size
-    if args.batch_size == "auto":
-        # Get a sample input for auto-tuning
-        sample_input = torch.tensor([train_data[0]["input_ids"]])
-        batch_size = get_batch_size(
-            student, args.width, sample_input, force_autotune=args.force_autotune
-        )
-    else:
-        batch_size = int(args.batch_size)
-        print(f"Using manual batch size: {batch_size}")
+    print(f"Using batch size: {batch_size}")
 
     # Debug mode: overfit on 10 batches
     if args.debug:
@@ -377,12 +279,31 @@ def main():
         train_data = train_data.select(range(min(10 * batch_size, len(train_data))))
         val_data = val_data.select(range(min(batch_size, len(val_data))))
 
-    # Create validation batches (small enough to keep in memory)
-    val_batches = list(iterate_batches(val_data, batch_size))
-    print(f"Val batches: {len(val_batches)}")
+    # Create DataLoaders with prefetching
+    train_loader = DataLoader(
+        LogprobsDataset(train_data),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        prefetch_factor=2,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
+    val_loader = DataLoader(
+        LogprobsDataset(val_data),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        prefetch_factor=2,
+        drop_last=True,
+        collate_fn=collate_fn,
+    )
+    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     # Calculate training steps
-    steps_per_epoch = len(train_data) // batch_size
+    steps_per_epoch = len(train_loader)
     if args.debug:
         n_epochs_actual = 10  # 10 passes over 10 batches = 100 steps
         total_steps = steps_per_epoch * n_epochs_actual
@@ -456,13 +377,8 @@ def main():
     # Training loop
     global_step = 0
     for epoch in range(n_epochs_actual):
-        # Iterate through shuffled batches (memory-efficient)
-        train_iter = iterate_batches(
-            train_data, batch_size, shuffle=True, seed=1223 + epoch
-        )
-
         pbar = tqdm(
-            train_iter,
+            train_loader,
             total=steps_per_epoch,
             desc=f"Epoch {epoch + 1}/{n_epochs_actual}",
         )
@@ -528,7 +444,7 @@ def main():
                 )
 
             if (global_step + 1) % eval_every == 0:
-                val_loss = eval_model(student, val_batches, kld_loss, device)
+                val_loss = eval_model(student, val_loader, kld_loss, device)
                 wandb.log({"eval/loss": val_loss, "train/step": global_step})
                 print(f"\nStep {global_step}: val_loss={val_loss:.4f}")
 
