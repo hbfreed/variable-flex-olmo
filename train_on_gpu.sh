@@ -36,32 +36,37 @@ if ! command -v nvtop &>/dev/null; then
     fi
 fi
 
-# 3. Clone repo if not present
+# 3. Install build dependencies
+echo "=== Installing build dependencies ==="
+apt install -y python3.12-dev ninja-build
+
+# 4. Clone repo if not present
 if [ ! -d "variable-flex-olmo" ]; then
     echo "=== Cloning repository ==="
     git clone "$REPO_URL"
 fi
+source .bashrc
 cd variable-flex-olmo
 
-# 4. Install Python dependencies
+# 5. Install Python dependencies
 echo "=== Installing dependencies ==="
 uv sync
 
-# 5. Check HuggingFace authentication
+# 6. Check HuggingFace authentication
 echo "=== Checking HuggingFace auth ==="
 if ! uv run huggingface-cli whoami &>/dev/null; then
     echo "Please log in to HuggingFace:"
     uv run huggingface-cli login
 fi
 
-# 6. Check Weights & Biases authentication
+# 7. Check Weights & Biases authentication
 echo "=== Checking wandb auth ==="
 if ! uv run wandb verify &>/dev/null 2>&1; then
     echo "Please log in to Weights & Biases:"
     uv run wandb login
 fi
 
-# 7. Train all models in size-pair order
+# 8. Train all models in size-pair order
 train_model() {
     local importance=$1
     local width=$2
