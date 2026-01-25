@@ -134,12 +134,13 @@ def load_pruned_model(save_path, device="cuda"):
     from safetensors.torch import load_file
     from huggingface_hub import snapshot_download
 
-    # If local path doesn't exist, try downloading from hub
-    if not os.path.exists(save_path):
+    # If model file doesn't exist, try downloading from hub
+    model_file = os.path.join(save_path, "model.safetensors")
+    if not os.path.exists(model_file):
         # Derive hub repo from path: pruned_models/flex_math_2048 -> hbfreed/flex-math-2048
         model_name = os.path.basename(save_path)  # flex_math_2048
         repo_id = f"hbfreed/{model_name.replace('_', '-')}"  # hbfreed/flex-math-2048
-        print(f"Local path {save_path} not found, downloading from {repo_id}...")
+        print(f"Model file not found at {save_path}, downloading from {repo_id}...")
         save_path = snapshot_download(repo_id, local_dir=save_path)
 
     # Load metadata
