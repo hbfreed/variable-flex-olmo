@@ -15,15 +15,16 @@ import time
 
 import torch
 import torch.nn.functional as F
-import wandb
 from datasets import load_dataset
-from huggingface_hub import HfApi
+from huggingface_hub import HfApi, hf_hub_download
 from liger_kernel.transformers import LigerKLDIVLoss
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from prune_flex_olmo import TOKENIZER_NAME, load_pruned_model, save_pruned_model
+import wandb
+from prune_flex_olmo import load_pruned_model, save_pruned_model
 
+# old apis for torch.compile compatibility
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.backends.cudnn.benchmark = True
@@ -34,7 +35,6 @@ IMPORTANCE_TYPES = ["math", "general"]
 
 # Data config
 LOGPROBS_DATASET = "hbfreed/flexolmo-math-logprobs"
-SEQ_LEN = 4096
 TOP_K = 128  # from generate_logprobs.py
 
 # Training config
@@ -184,10 +184,20 @@ def save_checkpoint(
         print(f"Pushed to {hub_repo}")
 
 
-def load_checkpoint(checkpoint_dir):
-    """Load training state from local checkpoint. Returns (step, state) or (0, None)."""
+def load_checkpoint(checkpoint_dir, hub_repo=None):
+    """Load training state from local checkpoint or HF Hub. Returns (step, state) or (0, None)."""
     info_path = os.path.join(checkpoint_dir, "checkpoint_info.json")
     state_path = os.path.join(checkpoint_dir, "training_state.pt")
+
+    # Try downloading from HF if local files missing
+    if hub_repo and not os.path.exists(state_path):
+        try:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+            hf_hub_download(hub_repo, "training_state.pt", local_dir=checkpoint_dir)
+            hf_hub_download(hub_repo, "checkpoint_info.json", local_dir=checkpoint_dir)
+            print(f"Downloaded training state from {hub_repo}")
+        except Exception as e:
+            print(f"No training state on HF Hub: {e}")
 
     if not os.path.exists(info_path) or not os.path.exists(state_path):
         return 0, None
@@ -238,6 +248,12 @@ def parse_args():
         default=4,
         help="Number of DataLoader workers for prefetching (default: 4)",
     )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=4096,
+        help=f"Sequence length (default: {4096})",
+    )
     return parser.parse_args()
 
 
@@ -250,7 +266,7 @@ def main():
     hub_repo = f"hbfreed/flex-{args.importance}-{args.width}"
 
     # Check for existing checkpoint
-    resume_step, resume_state = load_checkpoint(checkpoint_dir)
+    resume_step, resume_state = load_checkpoint(checkpoint_dir, hub_repo)
 
     # Load data from HuggingFace (memory-mapped)
     dataset = load_logprobs_dataset()
@@ -270,6 +286,10 @@ def main():
     else:
         print(f"Loading student model from {model_path}...")
         student = load_pruned_model(model_path, device=device)
+
+    student.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
 
     print(f"Using batch size: {batch_size}")
 
@@ -320,7 +340,7 @@ def main():
     print(f"Steps per epoch: {steps_per_epoch}")
     print(f"Total steps: {total_steps}")
     print(f"Resume step: {resume_step}")
-    print(f"Tokens per step: {batch_size * SEQ_LEN:,}")
+    print(f"Tokens per step: {batch_size * args.seq_len:,}")
     print(f"Eval every: {eval_every} steps")
     print(f"Save every: {save_every} steps")
 
@@ -353,7 +373,7 @@ def main():
             "importance": args.importance,
             "width": args.width,
             "model_path": model_path,
-            "seq_len": SEQ_LEN,
+            "seq_len": args.seq_len,
             "batch_size": batch_size,
             "steps_per_epoch": steps_per_epoch,
             "n_epochs": n_epochs_actual,
