@@ -84,14 +84,7 @@ echo "Batch sizes will be auto-tuned and cached per GPU/width"
 echo ""
 
 # Train smallest to largest (2048 → 5504 → 8192)
-train_model math 2048
 train_model general 2048
-
-train_model math 5504
-train_model general 5504
-
-train_model math 8192
-train_model general 8192
 
 echo ""
 echo "========================================"
