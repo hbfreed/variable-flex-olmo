@@ -314,9 +314,11 @@ def main():
         print(f"Loading student model from {model_path}...")
         student = load_pruned_model(model_path, device=device)
 
-    student.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
+    # Gradient checkpointing trades compute for memory. With grad accumulation,
+    # activations are freed after each micro-batch backward, so not needed.
+    # student.gradient_checkpointing_enable(
+    #     gradient_checkpointing_kwargs={"use_reentrant": False}
+    # )
 
     print(f"Using batch size: {batch_size}")
 
