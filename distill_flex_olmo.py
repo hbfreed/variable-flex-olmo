@@ -18,7 +18,7 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from huggingface_hub import HfApi, hf_hub_download
 from liger_kernel.transformers import LigerKLDIVLoss
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
 import wandb
@@ -45,6 +45,24 @@ wandb_project = "flex-olmo-distillation"
 
 device = "cuda"
 torch.manual_seed(1223)
+
+
+class SkipShuffleSampler(Sampler):
+    """Shuffled sampler that can skip the first N samples (for fast resume)."""
+
+    def __init__(self, data_source, skip: int = 0, seed: int = 1223):
+        self.data_source = data_source
+        self.skip = skip
+        self.seed = seed
+
+    def __iter__(self):
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+        indices = torch.randperm(len(self.data_source), generator=g).tolist()
+        return iter(indices[self.skip :])
+
+    def __len__(self):
+        return len(self.data_source) - self.skip
 
 
 def load_logprobs_dataset():
@@ -300,10 +318,13 @@ def main():
         val_data = val_data.select(range(min(batch_size, len(val_data))))
 
     # Create DataLoaders with prefetching
+    # Use SkipShuffleSampler for fast resume (skips at sampler level, not iteration level)
+    train_dataset = LogprobsDataset(train_data)
+    skip_samples = resume_step * batch_size
     train_loader = DataLoader(
-        LogprobsDataset(train_data),
+        train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=SkipShuffleSampler(train_dataset, skip=skip_samples),
         num_workers=args.num_workers,
         pin_memory=True,
         prefetch_factor=2,
@@ -394,21 +415,15 @@ def main():
         except Exception as e:
             print(f"Repo creation note: {e}")
 
-    # Training loop
-    global_step = 0
+    # Training loop (skip is handled at sampler level, so we start at resume_step)
+    global_step = resume_step
     for epoch in range(n_epochs_actual):
         pbar = tqdm(
             train_loader,
-            total=steps_per_epoch,
+            total=len(train_loader),
             desc=f"Epoch {epoch + 1}/{n_epochs_actual}",
         )
         for batch in pbar:
-            # Skip to resume point
-            if global_step < resume_step:
-                global_step += 1
-                pbar.set_postfix(skipping=f"{global_step}/{resume_step}")
-                continue
-
             step_start_time = time.time()
             batch = move_batch_to_device(batch, device)
 
