@@ -39,6 +39,7 @@ TOP_K = 128  # from generate_logprobs.py
 
 # Training config
 DEFAULT_BATCH_SIZE = 2
+DEFAULT_GRAD_ACCUM_STEPS = 32  # 32 * 2 * 4096 = 256k tokens per optimizer step
 n_epochs = 1
 val_split = 0.02  # fraction of data for validation
 wandb_project = "flex-olmo-distillation"
@@ -272,12 +273,20 @@ def parse_args():
         default=4096,
         help=f"Sequence length (default: {4096})",
     )
+    parser.add_argument(
+        "--grad-accum-steps",
+        "-g",
+        type=int,
+        default=DEFAULT_GRAD_ACCUM_STEPS,
+        help=f"Gradient accumulation steps (default: {DEFAULT_GRAD_ACCUM_STEPS})",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
     batch_size = args.batch_size
+    grad_accum_steps = args.grad_accum_steps
 
     model_path = f"pruned_models/flex_{args.importance}_{args.width}"
     checkpoint_dir = f"checkpoints/flex_{args.importance}_{args.width}"
@@ -319,8 +328,9 @@ def main():
 
     # Create DataLoaders with prefetching
     # Use SkipShuffleSampler for fast resume (skips at sampler level, not iteration level)
+    # Skip based on micro-batches: resume_step * grad_accum_steps * batch_size
     train_dataset = LogprobsDataset(train_data)
-    skip_samples = resume_step * batch_size
+    skip_samples = resume_step * grad_accum_steps * batch_size
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -343,8 +353,9 @@ def main():
     )
     print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
-    # Calculate training steps
-    steps_per_epoch = len(train_loader)
+    # Calculate training steps (optimizer steps, not micro-batches)
+    micro_batches_per_epoch = len(train_loader)
+    steps_per_epoch = micro_batches_per_epoch // grad_accum_steps
     if args.debug:
         n_epochs_actual = 10  # 10 passes over 10 batches = 100 steps
         total_steps = steps_per_epoch * n_epochs_actual
@@ -358,10 +369,13 @@ def main():
         else max(1, min(1000, int(total_steps * 0.05)))
     )
 
-    print(f"Steps per epoch: {steps_per_epoch}")
-    print(f"Total steps: {total_steps}")
+    tokens_per_step = batch_size * args.seq_len * grad_accum_steps
+    print(f"Gradient accumulation steps: {grad_accum_steps}")
+    print(f"Micro-batches per epoch: {micro_batches_per_epoch}")
+    print(f"Optimizer steps per epoch: {steps_per_epoch}")
+    print(f"Total optimizer steps: {total_steps}")
     print(f"Resume step: {resume_step}")
-    print(f"Tokens per step: {batch_size * args.seq_len:,}")
+    print(f"Tokens per optimizer step: {tokens_per_step:,}")
     print(f"Eval every: {eval_every} steps")
     print(f"Save every: {save_every} steps")
 
@@ -396,6 +410,9 @@ def main():
             "model_path": model_path,
             "seq_len": args.seq_len,
             "batch_size": batch_size,
+            "grad_accum_steps": grad_accum_steps,
+            "effective_batch_size": batch_size * grad_accum_steps,
+            "tokens_per_step": tokens_per_step,
             "steps_per_epoch": steps_per_epoch,
             "n_epochs": n_epochs_actual,
             "total_steps": total_steps,
@@ -417,6 +434,11 @@ def main():
 
     # Training loop (skip is handled at sampler level, so we start at resume_step)
     global_step = resume_step
+    micro_step = 0
+    accumulated_loss = 0.0
+    accumulated_tokens = 0
+    step_start_time = time.time()
+
     for epoch in range(n_epochs_actual):
         pbar = tqdm(
             train_loader,
@@ -424,7 +446,6 @@ def main():
             desc=f"Epoch {epoch + 1}/{n_epochs_actual}",
         )
         for batch in pbar:
-            step_start_time = time.time()
             batch = move_batch_to_device(batch, device)
 
             student_logprobs = F.log_softmax(
@@ -442,48 +463,61 @@ def main():
                 teacher_logits.dtype
             )
 
+            # Scale loss for gradient accumulation
             loss = kld_loss(student_logprobs_at_topk.float(), teacher_logprobs.float())
-            loss.backward()
+            scaled_loss = loss / grad_accum_steps
+            scaled_loss.backward()
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            accumulated_loss += loss.item()
+            accumulated_tokens += pad_mask.sum().item()
+            micro_step += 1
 
-            step_time = time.time() - step_start_time
-            num_tokens = pad_mask.sum().item()
-            throughput = num_tokens / step_time
+            # Only update weights after accumulating enough gradients
+            if micro_step % grad_accum_steps == 0:
+                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            wandb.log(
-                {
-                    "train/loss": loss.item(),
-                    "train/lr": scheduler.get_last_lr()[0],
-                    "train/grad_norm": grad_norm.item(),
-                    "train/throughput": throughput,
-                    "train/step": global_step,
-                }
-            )
-            pbar.set_postfix(loss=f"{loss.item():.4f}", toks=f"{throughput:.0f}")
+                step_time = time.time() - step_start_time
+                avg_loss = accumulated_loss / grad_accum_steps
+                throughput = accumulated_tokens / step_time
 
-            if (global_step + 1) % save_every == 0:
-                save_checkpoint(
-                    student,
-                    optimizer,
-                    scheduler,
-                    global_step,
-                    checkpoint_dir,
-                    args.importance,
-                    args.width,
-                    args.push_to_hub,
-                    hub_repo,
+                wandb.log(
+                    {
+                        "train/loss": avg_loss,
+                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/grad_norm": grad_norm.item(),
+                        "train/throughput": throughput,
+                        "train/step": global_step,
+                    }
                 )
+                pbar.set_postfix(loss=f"{avg_loss:.4f}", toks=f"{throughput:.0f}")
 
-            if (global_step + 1) % eval_every == 0:
-                val_loss = eval_model(student, val_loader, kld_loss, device)
-                wandb.log({"eval/loss": val_loss, "train/step": global_step})
-                print(f"\nStep {global_step}: val_loss={val_loss:.4f}")
+                if (global_step + 1) % save_every == 0:
+                    save_checkpoint(
+                        student,
+                        optimizer,
+                        scheduler,
+                        global_step,
+                        checkpoint_dir,
+                        args.importance,
+                        args.width,
+                        args.push_to_hub,
+                        hub_repo,
+                    )
 
-            global_step += 1
+                if (global_step + 1) % eval_every == 0:
+                    val_loss = eval_model(student, val_loader, kld_loss, device)
+                    wandb.log({"eval/loss": val_loss, "train/step": global_step})
+                    print(f"\nStep {global_step}: val_loss={val_loss:.4f}")
+
+                global_step += 1
+
+                # Reset accumulators for next step
+                accumulated_loss = 0.0
+                accumulated_tokens = 0
+                step_start_time = time.time()
 
     # Final save
     save_checkpoint(
