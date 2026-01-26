@@ -33,3 +33,8 @@ pruned_models/
 checkpoints/
 results/
 wandb/
+
+# wandb plotting script and outputs
+plot_wandb_losses.py
+wandb_history_*.csv
+*_loss_comparison.png

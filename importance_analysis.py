@@ -44,15 +44,12 @@ DATASETS = {
             "data/math/tulu_math/**/*.jsonl",
         ],
         "cache_path": "cached_analysis_tokens_math.safetensors",
-        "output_path": "importance_scores_tensors/importance_scores_math.safetensors",
+        "output_path": "importance_scores_tensors/importance_scores_math_new.safetensors",
     },
     "general": {
-        "data_files": [
-            "data/flan/**/*.json.gz",
-            "data/wiki/**/*.json.gz",
-        ],
+        # No data_files = use full dataset
         "cache_path": "cached_analysis_tokens_general.safetensors",
-        "output_path": "importance_scores_tensors/importance_scores_general.safetensors",
+        "output_path": "importance_scores_tensors/importance_scores_general_new.safetensors",
     },
 }
 
@@ -61,9 +58,10 @@ num_samples = 1024  # specified in the nvidia paper
 batch_size = 8  # adjust for hardware
 
 
-def get_dataset():
+def get_dataset(data_files=None):
     ds = load_dataset(
         "allenai/dolmino-mix-1124",
+        data_files=data_files,
         split="train",
         streaming=True,
     ).shuffle(buffer_size=50_000, seed=1223)
@@ -106,7 +104,8 @@ def load_or_cache_tokens(config):
     if Path(cache_path).exists():
         return load_file(cache_path)["tokens"]
 
-    dataset = tokenize_dataset(get_dataset())
+    data_files = config.get("data_files")
+    dataset = tokenize_dataset(get_dataset(data_files))
     total_tokens = sequence_length * num_samples
     all_tokens = torch.tensor(dataset[:total_tokens]).view(num_samples, sequence_length)
     save_file({"tokens": all_tokens}, cache_path)
@@ -158,7 +157,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL,
         dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         device_map=device_map,
     )
 
