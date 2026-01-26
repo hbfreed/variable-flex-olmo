@@ -116,7 +116,7 @@ def eval_model(student, val_loader, kld_loss, device):
     student.eval()
     val_loss = 0
     n_batches = 0
-    for batch in val_loader:
+    for batch in tqdm(val_loader, desc="Validating"):
         batch = move_batch_to_device(batch, device)
         with torch.inference_mode():
             student_logprobs = F.log_softmax(

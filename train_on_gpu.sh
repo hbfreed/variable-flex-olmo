@@ -45,7 +45,6 @@ if [ ! -d "variable-flex-olmo" ]; then
     echo "=== Cloning repository ==="
     git clone "$REPO_URL"
 fi
-source .bashrc
 cd variable-flex-olmo
 
 # 5. Install Python dependencies
