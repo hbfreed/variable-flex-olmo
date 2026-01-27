@@ -280,6 +280,11 @@ def parse_args():
         default=DEFAULT_GRAD_ACCUM_STEPS,
         help=f"Gradient accumulation steps (default: {DEFAULT_GRAD_ACCUM_STEPS})",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Start fresh, ignore any existing checkpoints",
+    )
     return parser.parse_args()
 
 
@@ -293,7 +298,11 @@ def main():
     hub_repo = f"hbfreed/flex-{args.importance}-{args.width}"
 
     # Check for existing checkpoint
-    resume_step, resume_state = load_checkpoint(checkpoint_dir, hub_repo)
+    if args.no_resume:
+        resume_step, resume_state = 0, None
+        print("Starting fresh (--no-resume specified)")
+    else:
+        resume_step, resume_state = load_checkpoint(checkpoint_dir, hub_repo)
 
     # Load data from HuggingFace (memory-mapped)
     dataset = load_logprobs_dataset()
