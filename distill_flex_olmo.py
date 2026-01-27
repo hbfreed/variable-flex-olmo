@@ -15,6 +15,8 @@ import time
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.distributed import init_process_group, destroy_process_group
 from datasets import load_dataset
 from huggingface_hub import HfApi, hf_hub_download
 from liger_kernel.transformers import LigerKLDIVLoss
@@ -44,33 +46,59 @@ n_epochs = 1
 val_split = 0.02  # fraction of data for validation
 wandb_project = "flex-olmo-distillation"
 
-device = "cuda"
 torch.manual_seed(1223)
+
+# DDP setup - detect if launched with torchrun via RANK env var
+ddp = int(os.environ.get('RANK', -1)) != -1
+if ddp:
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device = f'cuda:{ddp_local_rank}'
+    torch.cuda.set_device(device)
+    init_process_group(backend='nccl', device_id=torch.device(device))
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    device = 'cuda'
+    master_process = True
+
+print(f"[DEBUG] RANK={os.environ.get('RANK', 'NOT SET')}, ddp={ddp}, master={master_process}, device={device}")
 
 
 class SkipShuffleSampler(Sampler):
-    """Shuffled sampler that can skip the first N samples (for fast resume)."""
+    """Shuffled sampler that can skip the first N samples (for fast resume).
 
-    def __init__(self, data_source, skip: int = 0, seed: int = 1223):
+    With DDP, shards data across GPUs using rank/world_size.
+    """
+
+    def __init__(self, data_source, skip: int = 0, seed: int = 1223, rank: int = 0, world_size: int = 1):
         self.data_source = data_source
         self.skip = skip
         self.seed = seed
+        self.rank = rank
+        self.world_size = world_size
 
     def __iter__(self):
         g = torch.Generator()
         g.manual_seed(self.seed)
         indices = torch.randperm(len(self.data_source), generator=g).tolist()
-        return iter(indices[self.skip :])
+        # Shard across GPUs
+        indices = indices[self.rank::self.world_size]
+        return iter(indices[self.skip:])
 
     def __len__(self):
-        return len(self.data_source) - self.skip
+        return len(self.data_source) // self.world_size - self.skip
 
 
 def load_logprobs_dataset():
     """Load logprobs from HuggingFace, keeping as memory-mapped Dataset."""
     from datasets import concatenate_datasets
 
-    print(f"Loading dataset from {LOGPROBS_DATASET}...")
+    if master_process:
+        print(f"Loading dataset from {LOGPROBS_DATASET}...")
 
     # Load all splits (train_0, train_1, etc.)
     ds = load_dataset(LOGPROBS_DATASET)
@@ -78,11 +106,13 @@ def load_logprobs_dataset():
     # Concatenate all splits into single Dataset (stays memory-mapped)
     splits = []
     for split_name in sorted(ds.keys()):
-        print(f"  Loading {split_name}: {len(ds[split_name])} sequences")
+        if master_process:
+            print(f"  Loading {split_name}: {len(ds[split_name])} sequences")
         splits.append(ds[split_name])
 
     combined = concatenate_datasets(splits)
-    print(f"Total sequences: {len(combined)}")
+    if master_process:
+        print(f"Total sequences: {len(combined)}")
     return combined
 
 
@@ -214,9 +244,11 @@ def load_checkpoint(checkpoint_dir, hub_repo=None):
             os.makedirs(checkpoint_dir, exist_ok=True)
             hf_hub_download(hub_repo, "training_state.pt", local_dir=checkpoint_dir)
             hf_hub_download(hub_repo, "checkpoint_info.json", local_dir=checkpoint_dir)
-            print(f"Downloaded training state from {hub_repo}")
+            if master_process:
+                print(f"Downloaded training state from {hub_repo}")
         except Exception as e:
-            print(f"No training state on HF Hub: {e}")
+            if master_process:
+                print(f"No training state on HF Hub: {e}")
 
     if not os.path.exists(info_path) or not os.path.exists(state_path):
         return 0, None
@@ -225,7 +257,8 @@ def load_checkpoint(checkpoint_dir, hub_repo=None):
         info = json.load(f)
 
     state = torch.load(state_path, map_location="cpu", weights_only=False)
-    print(f"Found checkpoint at step {info['step']}")
+    if master_process:
+        print(f"Found checkpoint at step {info['step']}")
     return info["step"], state
 
 
@@ -300,7 +333,8 @@ def main():
     # Check for existing checkpoint
     if args.no_resume:
         resume_step, resume_state = 0, None
-        print("Starting fresh (--no-resume specified)")
+        if master_process:
+            print("Starting fresh (--no-resume specified)")
     else:
         resume_step, resume_state = load_checkpoint(checkpoint_dir, hub_repo)
 
@@ -312,15 +346,18 @@ def main():
     train_data = split["train"]
     val_data = split["test"]
 
-    print(f"Train sequences: {len(train_data)}")
-    print(f"Val sequences: {len(val_data)}")
+    if master_process:
+        print(f"Train sequences: {len(train_data)}")
+        print(f"Val sequences: {len(val_data)}")
 
     # Load model (from checkpoint if resuming, otherwise from pruned model)
     if resume_step > 0:
-        print(f"Resuming from checkpoint at step {resume_step}...")
+        if master_process:
+            print(f"Resuming from checkpoint at step {resume_step}...")
         student = load_pruned_model(checkpoint_dir, device=device)
     else:
-        print(f"Loading student model from {model_path}...")
+        if master_process:
+            print(f"Loading student model from {model_path}...")
         student = load_pruned_model(model_path, device=device)
 
     # Gradient checkpointing trades compute for memory. With grad accumulation,
@@ -329,11 +366,17 @@ def main():
     #     gradient_checkpointing_kwargs={"use_reentrant": False}
     # )
 
-    print(f"Using batch size: {batch_size}")
+    # Wrap with DDP for multi-GPU training
+    if ddp:
+        student = DDP(student, device_ids=[ddp_local_rank])
+
+    if master_process:
+        print(f"Using batch size: {batch_size}")
 
     # Debug mode: overfit on 10 batches
     if args.debug:
-        print("\n*** DEBUG MODE: overfitting on 10 batches ***\n")
+        if master_process:
+            print("\n*** DEBUG MODE: overfitting on 10 batches ***\n")
         train_data = train_data.select(range(min(10 * batch_size, len(train_data))))
         val_data = val_data.select(range(min(batch_size, len(val_data))))
 
@@ -345,7 +388,7 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        sampler=SkipShuffleSampler(train_dataset, skip=skip_samples),
+        sampler=SkipShuffleSampler(train_dataset, skip=skip_samples, rank=ddp_rank, world_size=ddp_world_size),
         num_workers=args.num_workers,
         pin_memory=True,
         prefetch_factor=2,
@@ -362,9 +405,11 @@ def main():
         drop_last=True,
         collate_fn=collate_fn,
     )
-    print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
+    if master_process:
+        print(f"Train batches: {len(train_loader)}, Val batches: {len(val_loader)}")
 
     # Calculate training steps (optimizer steps, not micro-batches)
+    # With DDP, each GPU processes micro_batches_per_epoch / world_size batches
     micro_batches_per_epoch = len(train_loader)
     steps_per_epoch = micro_batches_per_epoch // grad_accum_steps
     if args.debug:
@@ -380,21 +425,25 @@ def main():
         else max(1, min(1000, int(total_steps * 0.05)))
     )
 
-    tokens_per_step = batch_size * args.seq_len * grad_accum_steps
-    print(f"Gradient accumulation steps: {grad_accum_steps}")
-    print(f"Micro-batches per epoch: {micro_batches_per_epoch}")
-    print(f"Optimizer steps per epoch: {steps_per_epoch}")
-    print(f"Total optimizer steps: {total_steps}")
-    print(f"Resume step: {resume_step}")
-    print(f"Tokens per optimizer step: {tokens_per_step:,}")
-    print(f"Eval every: {eval_every} steps")
-    print(f"Save every: {save_every} steps")
+    tokens_per_step = batch_size * args.seq_len * grad_accum_steps * ddp_world_size
+    if master_process:
+        print(f"Gradient accumulation steps: {grad_accum_steps}")
+        print(f"Micro-batches per epoch: {micro_batches_per_epoch}")
+        print(f"Optimizer steps per epoch: {steps_per_epoch}")
+        print(f"Total optimizer steps: {total_steps}")
+        print(f"Resume step: {resume_step}")
+        print(f"Tokens per optimizer step: {tokens_per_step:,}")
+        print(f"Eval every: {eval_every} steps")
+        print(f"Save every: {save_every} steps")
+        if ddp:
+            print(f"DDP: {ddp_world_size} GPUs")
 
     # Only optimize trainable params (expert 1)
     trainable_params = [p for p in student.parameters() if p.requires_grad]
-    print(
-        f"Trainable parameters: {sum(p.numel() for p in trainable_params) / 1e9:.2f}B"
-    )
+    if master_process:
+        print(
+            f"Trainable parameters: {sum(p.numel() for p in trainable_params) / 1e9:.2f}B"
+        )
 
     optimizer = torch.optim.AdamW(trainable_params, lr=2e-4, fused=True)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -403,7 +452,8 @@ def main():
 
     # Restore optimizer/scheduler state if resuming
     if resume_state is not None:
-        print("Restoring optimizer and scheduler state...")
+        if master_process:
+            print("Restoring optimizer and scheduler state...")
         optimizer.load_state_dict(resume_state["optimizer"])
         scheduler.load_state_dict(resume_state["scheduler"])
         torch.set_rng_state(resume_state["rng_state"])
@@ -412,36 +462,38 @@ def main():
 
     kld_loss = LigerKLDIVLoss(log_target=True)
 
-    wandb.init(
-        project=wandb_project,
-        mode="offline" if args.debug else "online",
-        config={
-            "importance": args.importance,
-            "width": args.width,
-            "model_path": model_path,
-            "seq_len": args.seq_len,
-            "batch_size": batch_size,
-            "grad_accum_steps": grad_accum_steps,
-            "effective_batch_size": batch_size * grad_accum_steps,
-            "tokens_per_step": tokens_per_step,
-            "steps_per_epoch": steps_per_epoch,
-            "n_epochs": n_epochs_actual,
-            "total_steps": total_steps,
-            "resume_step": resume_step,
-            "lr_start": 2e-4,
-            "lr_end": 4.5e-7,
-            "debug": args.debug,
-        },
-        resume="allow",
-    )
+    if master_process:
+        wandb.init(
+            project=wandb_project,
+            mode="offline" if args.debug else "online",
+            config={
+                "importance": args.importance,
+                "width": args.width,
+                "model_path": model_path,
+                "seq_len": args.seq_len,
+                "batch_size": batch_size,
+                "grad_accum_steps": grad_accum_steps,
+                "effective_batch_size": batch_size * grad_accum_steps * ddp_world_size,
+                "tokens_per_step": tokens_per_step,
+                "steps_per_epoch": steps_per_epoch,
+                "n_epochs": n_epochs_actual,
+                "total_steps": total_steps,
+                "resume_step": resume_step,
+                "lr_start": 2e-4,
+                "lr_end": 4.5e-7,
+                "debug": args.debug,
+                "ddp_world_size": ddp_world_size,
+            },
+            resume="allow",
+        )
 
-    # Create HF repo if pushing
-    if args.push_to_hub:
-        api = HfApi()
-        try:
-            api.create_repo(hub_repo, exist_ok=True)
-        except Exception as e:
-            print(f"Repo creation note: {e}")
+        # Create HF repo if pushing
+        if args.push_to_hub:
+            api = HfApi()
+            try:
+                api.create_repo(hub_repo, exist_ok=True)
+            except Exception as e:
+                print(f"Repo creation note: {e}")
 
     # Training loop (skip is handled at sampler level, so we start at resume_step)
     global_step = resume_step
@@ -455,6 +507,7 @@ def main():
             train_loader,
             total=len(train_loader),
             desc=f"Epoch {epoch + 1}/{n_epochs_actual}",
+            disable=not master_process,
         )
         for batch in pbar:
             batch = move_batch_to_device(batch, device)
@@ -494,20 +547,23 @@ def main():
                 avg_loss = accumulated_loss / grad_accum_steps
                 throughput = accumulated_tokens / step_time
 
-                wandb.log(
-                    {
-                        "train/loss": avg_loss,
-                        "train/lr": scheduler.get_last_lr()[0],
-                        "train/grad_norm": grad_norm.item(),
-                        "train/throughput": throughput,
-                        "train/step": global_step,
-                    }
-                )
-                pbar.set_postfix(loss=f"{avg_loss:.4f}", toks=f"{throughput:.0f}")
+                if master_process:
+                    wandb.log(
+                        {
+                            "train/loss": avg_loss,
+                            "train/lr": scheduler.get_last_lr()[0],
+                            "train/grad_norm": grad_norm.item(),
+                            "train/throughput": throughput,
+                            "train/step": global_step,
+                        }
+                    )
+                    pbar.set_postfix(loss=f"{avg_loss:.4f}", toks=f"{throughput:.0f}")
 
-                if (global_step + 1) % save_every == 0:
+                if master_process and (global_step + 1) % save_every == 0:
+                    # Save unwrapped model for DDP
+                    raw_model = student.module if ddp else student
                     save_checkpoint(
-                        student,
+                        raw_model,
                         optimizer,
                         scheduler,
                         global_step,
@@ -518,8 +574,9 @@ def main():
                         hub_repo,
                     )
 
-                if (global_step + 1) % eval_every == 0:
-                    val_loss = eval_model(student, val_loader, kld_loss, device)
+                if master_process and (global_step + 1) % eval_every == 0:
+                    raw_model = student.module if ddp else student
+                    val_loss = eval_model(raw_model, val_loader, kld_loss, device)
                     wandb.log({"eval/loss": val_loss, "train/step": global_step})
                     print(f"\nStep {global_step}: val_loss={val_loss:.4f}")
 
@@ -530,21 +587,26 @@ def main():
                 accumulated_tokens = 0
                 step_start_time = time.time()
 
-    # Final save
-    save_checkpoint(
-        student,
-        optimizer,
-        scheduler,
-        global_step,
-        checkpoint_dir,
-        args.importance,
-        args.width,
-        args.push_to_hub,
-        hub_repo,
-    )
+    # Final save (only on master)
+    if master_process:
+        raw_model = student.module if ddp else student
+        save_checkpoint(
+            raw_model,
+            optimizer,
+            scheduler,
+            global_step,
+            checkpoint_dir,
+            args.importance,
+            args.width,
+            args.push_to_hub,
+            hub_repo,
+        )
+        wandb.finish()
+        print("Done!")
 
-    wandb.finish()
-    print("Done!")
+    # Cleanup DDP
+    if ddp:
+        destroy_process_group()
 
 
 if __name__ == "__main__":

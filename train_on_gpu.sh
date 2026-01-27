@@ -65,25 +65,7 @@ if ! uv run wandb verify &>/dev/null 2>&1; then
     uv run wandb login
 fi
 
-# 8. Train all models in size-pair order
-train_model() {
-    local importance=$1
-    local width=$2
-    echo ""
-    echo "========================================"
-    echo "Training flex_${importance}_${width}"
-    echo "========================================"
-    # shellcheck disable=SC2086
-    uv run python distill_flex_olmo.py -i "$importance" -w "$width" $EXTRA_ARGS
-}
-
-echo ""
-echo "=== Starting training runs ==="
-echo "Batch sizes will be auto-tuned and cached per GPU/width"
-echo ""
-
-# Train smallest to largest (2048 → 5504 → 8192)
-train_model general 2048
+uv run torchrun --nproc_per_node=2 distill_flex_olmo.py -i math -w 8192 -b 2 -g 16
 
 echo ""
 echo "========================================"
