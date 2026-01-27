@@ -157,7 +157,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         MODEL,
         dtype=torch.bfloat16,
-        attn_implementation="sdpa",
+        attn_implementation="flash_attention_2",
         device_map=device_map,
     )
 
