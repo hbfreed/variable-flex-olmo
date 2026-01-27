@@ -27,3 +27,4 @@ torch = { index = "pytorch-nightly" }
 [[tool.uv.index]]
 name = "pytorch-nightly"
 url = "https://download.pytorch.org/whl/nightly/cu130"
+explicit = true  # Only use this index for packages explicitly mapped to it
