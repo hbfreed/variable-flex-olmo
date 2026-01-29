@@ -1,6 +1,20 @@
 # Variable FlexOlmo
 
-Megablocks-based MoE implementation for FlexOlmo models with support for variable-sized experts.
+Pruning and distillation for [FlexOlmo](https://arxiv.org/abs/2507.07024) experts. Shrink the specialized expert MLPs, retrain with KLD distillation, and get competitive math performance with significantly smaller experts.
+
+## Results
+
+Pruned models trained with ~228M tokens of distillation from [Flex-math-2x7B-1T](https://huggingface.co/allenai/Flex-math-2x7B-1T):
+
+| Model | Total Params | Expert Params | Expert Width | GSM8K | MATH | Math2 |
+|-------|-------------|---------------|-------------|-------|------|-------|
+| Public model, no expert | 7.3B | 0 | — | — | — | 8.1 |
+| Flex-math-2x7B-1T (baseline) | 11.6B | 4.3B | 11008 (100%) | 69.7 | 35.4 | 52.5 |
+| [flex-math-8192](https://huggingface.co/hbfreed/flex-math-8192) | 10.5B | 3.2B | 8192 (74%) | 70.1 | 31.3 | 50.7 |
+| [flex-math-5504](https://huggingface.co/hbfreed/flex-math-5504) | 9.5B | 2.2B | 5504 (50%) | 66.6 | 26.8 | 46.7 |
+| [flex-math-2048](https://huggingface.co/hbfreed/flex-math-2048) | 8.1B | 0.8B | 2048 (19%) | 44.3 | 13.9 | 29.1 |
+
+The 8192 model matches the full-sized expert. Even the 2048 model (0.8B expert) scores 3.6x the no-expert baseline.
 
 ## FlexOlmo Expert Mapping
 
@@ -41,10 +55,10 @@ The `FlexOlmo-7x7B-1T` model has a different composition:
 
 ### Verification
 
-Run `identify_base_expert.py` to verify these mappings:
+Run `scripts/identify_base_expert.py` to verify these mappings:
 
 ```bash
-uv run python identify_base_expert.py
+uv run python scripts/identify_base_expert.py
 ```
 
 This script compares weights using `torch.allclose` between:
@@ -74,17 +88,29 @@ For 2 experts with top-k=2 (every token goes to both experts), a specialized imp
 | 4096        | 1.17x   |
 | 65536       | 1.16x   |
 
-### Hybrid Loop/Sparse Dispatch
+## Training
 
-For other configurations, automatically selects between loop and sparse:
+```bash
+# Single GPU
+uv run python distill_flex_olmo.py -w WIDTH --push-to-hub
 
-| Expert Count | Token Count | Implementation |
-|-------------|-------------|----------------|
-| 2 (top-k=2) | any | hardcoded 2x2 |
-| ≤2 | any | loop |
-| 3-7 | <1024 | loop |
-| 3-7 | ≥1024 | sparse |
-| ≥8 | <16 | loop |
-| ≥8 | ≥16 | sparse |
+# Multi-GPU
+uv run torchrun --nproc_per_node=N distill_flex_olmo.py -w WIDTH --push-to-hub
+```
 
-This was determined empirically via `benchmark_loop_vs_sparse.py`.
+Widths: 2048, 5504, 8192. Add `--resume` to continue from checkpoint.
+
+## Evaluation
+
+Run evals with lm-eval-harness:
+
+```bash
+uv run lm_eval --model hf \
+    --model_args "pretrained=hbfreed/flex-math-2048,tokenizer=allenai/dolma2-tokenizer,trust_remote_code=True,dtype=bfloat16,attn_implementation=flash_attention_2" \
+    --tasks gsm8k_cot,minerva_math \
+    --batch_size auto \
+    --device cuda:0 \
+    --output_path ./results/flex-math-2048
+```
+
+For multi-GPU, add `parallelize=True` to model_args and remove `--device`.

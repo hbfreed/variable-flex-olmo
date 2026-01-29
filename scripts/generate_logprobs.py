@@ -1,7 +1,11 @@
-# would use vllm, but having reboots every time i run tp, so hf pp :((((((
+# would use vllm, but multi gpu with vllm is broken with this model.
 import gc
+import sys
 from itertools import chain
 from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import torch
 from datasets import Dataset, load_dataset
@@ -143,7 +147,7 @@ def load_or_build_chunks():
 
 
 def get_device_map():
-    """Hardcoded device map for actual even distribution. HuggingFace auto and crap is so busted lol"""
+    """Hardcoded device map for actual even distribution. HuggingFace auto/balanced/whatever is not ideal"""
     device_map = {"model.embed_tokens": 0}
     # GPU 0: layers 0-5 (6 layers) + embed
     for i in range(6):

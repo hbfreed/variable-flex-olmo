@@ -6,8 +6,6 @@ import bitsandbytes as bnb
 import torch
 from megablocks.layers.silu import silu
 
-from megablocks_core import moe_forward
-
 
 def dequantize_if_needed(linear_layer) -> torch.Tensor:
     """Extract weight from a Linear layer, dequantizing if 4-bit."""
@@ -86,22 +84,3 @@ class FlexOlmoAdapter:
 
         return {"w1_gate": w1_gate, "w1_up": w1_up, "w2": w2}
 
-    def forward(self, hidden_states, top_k_index, top_k_weights, transformed_weights):
-        return moe_forward(
-            hidden_states=hidden_states,
-            top_k_index=top_k_index,
-            top_k_weights=top_k_weights,
-            w1_up=transformed_weights["w1_up"],
-            w1=transformed_weights["w1_gate"],
-            w2=transformed_weights["w2"],
-            activation_fn=self.activation,
-            num_experts=self.num_experts,
-            num_active_experts=self.num_active_experts,
-            sort_end_bit=self.sort_end_bit,
-            transpose_sort_end_bit=self.transpose_sort_end_bit,
-            block_size=self.block_size,
-            expert_size_blocks=self.expert_size_blocks,
-            expert_block_offsets=self.expert_block_offsets,
-            total_expert_width=self.total_expert_width,
-            precomputed_offsets_2x2=self.precomputed_offsets_2x2,
-        )

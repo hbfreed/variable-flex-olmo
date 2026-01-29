@@ -96,13 +96,15 @@ def count_params(model, trainable_only=False):
 
 
 def save_pruned_model(model, save_path, importance_type, expert_1_width):
-    """Save pruned model in a loadable format.
+    """Save pruned model in HuggingFace-compatible format.
 
     Saves:
-    - Full model state dict (for complete restore)
-    - Metadata (importance type, width) for reconstruction
+    - model.safetensors: Full model state dict
+    - config.json: Model config with auto_map for trust_remote_code loading
+    - modeling/configuration files: Custom classes for HF loading
     """
     import json
+    import shutil
     from pathlib import Path
     from safetensors.torch import save_file
 
@@ -112,72 +114,114 @@ def save_pruned_model(model, save_path, importance_type, expert_1_width):
     state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
     save_file(state_dict, f"{save_path}/model.safetensors")
 
-    # Save metadata
-    metadata = {
+    # Build config with auto_map for trust_remote_code
+    config_dict = model.config.to_dict()
+    config_dict["model_type"] = "pruned_flex_olmo"
+    config_dict["expert_1_intermediate_size"] = expert_1_width
+    config_dict["auto_map"] = {
+        "AutoConfig": "configuration_pruned_flex_olmo.PrunedFlexOlmoConfig",
+        "AutoModelForCausalLM": "modeling_pruned_flex_olmo.PrunedFlexOlmoForCausalLM",
+    }
+    # Add metadata for reference
+    config_dict["_pruning_metadata"] = {
         "base_model": MODEL,
         "importance_type": importance_type,
-        "expert_1_width": expert_1_width,
     }
-    with open(f"{save_path}/pruning_config.json", "w") as f:
-        json.dump(metadata, f, indent=2)
+
+    with open(f"{save_path}/config.json", "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    # Copy the modeling and configuration files
+    repo_root = Path(__file__).parent
+    for filename in ["modeling_pruned_flex_olmo.py", "configuration_pruned_flex_olmo.py"]:
+        src = repo_root / filename
+        if src.exists():
+            shutil.copy(src, f"{save_path}/{filename}")
 
     print(f"Saved pruned model to {save_path}")
 
 
 def load_pruned_model(save_path, device="cuda"):
-    """Load a pruned model by creating matching architecture then loading weights.
+    """Load a pruned model using HuggingFace's AutoModelForCausalLM.
 
-    If local path doesn't exist, attempts to download from HuggingFace Hub.
+    Works with both local paths and HuggingFace Hub repo IDs.
     """
-    import json
     import os
-    from safetensors.torch import load_file
-    from huggingface_hub import snapshot_download
 
-    # If model file doesn't exist, try downloading from hub
-    model_file = os.path.join(save_path, "model.safetensors")
-    if not os.path.exists(model_file):
-        # Derive hub repo from path: pruned_models/flex_math_2048 -> hbfreed/flex-math-2048
+    # If local path doesn't exist, derive hub repo ID
+    if not os.path.exists(save_path):
         model_name = os.path.basename(save_path)  # flex_math_2048
-        repo_id = f"hbfreed/{model_name.replace('_', '-')}"  # hbfreed/flex-math-2048
-        print(f"Model file not found at {save_path}, downloading from {repo_id}...")
-        save_path = snapshot_download(repo_id, local_dir=save_path)
+        save_path = f"hbfreed/{model_name.replace('_', '-')}"  # hbfreed/flex-math-2048
+        print(f"Loading from HuggingFace Hub: {save_path}")
 
-    # Load metadata
-    with open(f"{save_path}/pruning_config.json") as f:
-        metadata = json.load(f)
+    model = AutoModelForCausalLM.from_pretrained(
+        save_path,
+        dtype=torch.bfloat16,
+        trust_remote_code=True,
+    )
 
-    expert_1_width = metadata["expert_1_width"]
-    print(f"Loading pruned model: width={expert_1_width}")
-
-    # Load state dict first to get shapes
-    state_dict = load_file(f"{save_path}/model.safetensors")
-
-    # Load base model
-    print(f"Loading base model {MODEL}...")
-    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16)
-
-    # Freeze all params
+    # Freeze all params (expert 1 will be unfrozen by training script if needed)
     for param in model.parameters():
         param.requires_grad = False
 
-    # Replace expert 1 in each layer with correctly-sized PrunedFlexOlmoMLP
-    for layer_idx, layer in enumerate(model.model.layers):
-        expert_1 = layer.mlp.experts[1]
-
-        # Create pruned expert with correct shapes (will be overwritten by state_dict)
-        pruned_expert_1 = PrunedFlexOlmoMLP(
-            gate_proj_weight=torch.zeros(expert_1_width, HIDDEN_SIZE, dtype=torch.bfloat16),
-            up_proj_weight=torch.zeros(expert_1_width, HIDDEN_SIZE, dtype=torch.bfloat16),
-            down_proj_weight=torch.zeros(HIDDEN_SIZE, expert_1_width, dtype=torch.bfloat16),
-            act_fn=expert_1.act_fn,
-        )
-        layer.mlp.experts[1] = pruned_expert_1
-
-    # Load saved weights
-    model.load_state_dict(state_dict)
-
     return model.to(device)
+
+
+def convert_old_format_to_new(save_path):
+    """Convert old pruning_config.json format to new HF-compatible config.json format."""
+    import json
+    import shutil
+    from pathlib import Path
+
+    save_path = Path(save_path)
+    old_config_path = save_path / "pruning_config.json"
+    new_config_path = save_path / "config.json"
+
+    if not old_config_path.exists():
+        print(f"No old format config found at {old_config_path}")
+        return
+
+    if new_config_path.exists():
+        print(f"New format config already exists at {new_config_path}")
+        return
+
+    # Load old metadata
+    with open(old_config_path) as f:
+        old_metadata = json.load(f)
+
+    expert_1_width = old_metadata["expert_1_width"]
+    importance_type = old_metadata.get("importance_type", "unknown")
+    base_model = old_metadata.get("base_model", MODEL)
+
+    # Get base model config
+    from transformers import AutoConfig
+    base_config = AutoConfig.from_pretrained(base_model)
+    config_dict = base_config.to_dict()
+
+    # Add pruned model specifics
+    config_dict["model_type"] = "pruned_flex_olmo"
+    config_dict["expert_1_intermediate_size"] = expert_1_width
+    config_dict["auto_map"] = {
+        "AutoConfig": "configuration_pruned_flex_olmo.PrunedFlexOlmoConfig",
+        "AutoModelForCausalLM": "modeling_pruned_flex_olmo.PrunedFlexOlmoForCausalLM",
+    }
+    config_dict["_pruning_metadata"] = {
+        "base_model": base_model,
+        "importance_type": importance_type,
+    }
+
+    # Save new config
+    with open(new_config_path, "w") as f:
+        json.dump(config_dict, f, indent=2)
+
+    # Copy modeling files
+    repo_root = Path(__file__).parent
+    for filename in ["modeling_pruned_flex_olmo.py", "configuration_pruned_flex_olmo.py"]:
+        src = repo_root / filename
+        if src.exists():
+            shutil.copy(src, save_path / filename)
+
+    print(f"Converted {save_path} to new HF-compatible format")
 
 
 def prune_model(expert_1_width, importance_path):

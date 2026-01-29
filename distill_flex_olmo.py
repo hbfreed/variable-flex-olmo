@@ -8,18 +8,17 @@ Only expert 1's parameters are passed to the optimizer.
 """
 
 import argparse
-import json
 import os
 import random
 import time
 
 import torch
 import torch.nn.functional as F
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 from datasets import load_dataset
 from huggingface_hub import HfApi, hf_hub_download
 from liger_kernel.transformers import LigerKLDIVLoss
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, Sampler
 from tqdm import tqdm
 
@@ -33,15 +32,14 @@ torch.backends.cudnn.benchmark = True
 
 # Model config
 WIDTHS = [8192, 5504, 2048]
-IMPORTANCE_TYPES = ["math", "general"]
 
 # Data config
 LOGPROBS_DATASET = "hbfreed/flexolmo-math-logprobs"
-TOP_K = 128  # from generate_logprobs.py
 
 # Training config
 DEFAULT_BATCH_SIZE = 2
-DEFAULT_GRAD_ACCUM_STEPS = 32  # 32 * 2 * 4096 = 256k tokens per optimizer step
+SEQ_LEN = 4096
+TARGET_TOKENS_PER_STEP = 262144  # 256k tokens per optimizer step
 n_epochs = 1
 val_split = 0.02  # fraction of data for validation
 wandb_project = "flex-olmo-distillation"
@@ -49,23 +47,21 @@ wandb_project = "flex-olmo-distillation"
 torch.manual_seed(1223)
 
 # DDP setup - detect if launched with torchrun via RANK env var
-ddp = int(os.environ.get('RANK', -1)) != -1
+ddp = int(os.environ.get("RANK", -1)) != -1
 if ddp:
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    device = f'cuda:{ddp_local_rank}'
+    ddp_rank = int(os.environ["RANK"])
+    ddp_local_rank = int(os.environ["LOCAL_RANK"])
+    ddp_world_size = int(os.environ["WORLD_SIZE"])
+    device = f"cuda:{ddp_local_rank}"
     torch.cuda.set_device(device)
-    init_process_group(backend='nccl', device_id=torch.device(device))
+    init_process_group(backend="nccl", device_id=torch.device(device))
     master_process = ddp_rank == 0
 else:
     ddp_rank = 0
     ddp_local_rank = 0
     ddp_world_size = 1
-    device = 'cuda'
+    device = "cuda"
     master_process = True
-
-print(f"[DEBUG] RANK={os.environ.get('RANK', 'NOT SET')}, ddp={ddp}, master={master_process}, device={device}")
 
 
 class SkipShuffleSampler(Sampler):
@@ -74,7 +70,14 @@ class SkipShuffleSampler(Sampler):
     With DDP, shards data across GPUs using rank/world_size.
     """
 
-    def __init__(self, data_source, skip: int = 0, seed: int = 1223, rank: int = 0, world_size: int = 1):
+    def __init__(
+        self,
+        data_source,
+        skip: int = 0,
+        seed: int = 1223,
+        rank: int = 0,
+        world_size: int = 1,
+    ):
         self.data_source = data_source
         self.skip = skip
         self.seed = seed
@@ -86,8 +89,8 @@ class SkipShuffleSampler(Sampler):
         g.manual_seed(self.seed)
         indices = torch.randperm(len(self.data_source), generator=g).tolist()
         # Shard across GPUs
-        indices = indices[self.rank::self.world_size]
-        return iter(indices[self.skip:])
+        indices = indices[self.rank :: self.world_size]
+        return iter(indices[self.skip :])
 
     def __len__(self):
         return len(self.data_source) // self.world_size - self.skip
@@ -142,14 +145,12 @@ def collate_fn(batch):
 
     bs, seq_len = input_ids.shape
     position_ids = torch.arange(seq_len).unsqueeze(0).expand(bs, -1).contiguous()
-    pad_mask = torch.ones(bs, seq_len, dtype=torch.bool)
 
     return {
         "input_ids": input_ids,
         "position_ids": position_ids,
         "teacher_indices": topk_indices,
         "teacher_logits": topk_logprobs,
-        "pad_mask": pad_mask,
     }
 
 
@@ -172,14 +173,11 @@ def eval_model(student, val_loader, kld_loss, device):
                 student(batch["input_ids"], position_ids=batch["position_ids"]).logits,
                 dim=-1,
             )
-            pad_mask = batch["pad_mask"]
             student_logprobs_at_topk = student_logprobs.gather(
                 -1, batch["teacher_indices"]
             )
-            student_logprobs_at_topk = student_logprobs_at_topk[pad_mask]
-            teacher_logits = batch["teacher_logits"][pad_mask]
-            teacher_logprobs = F.log_softmax(teacher_logits.float(), dim=-1).to(
-                teacher_logits.dtype
+            teacher_logprobs = F.log_softmax(batch["teacher_logits"].float(), dim=-1).to(
+                batch["teacher_logits"].dtype
             )
             val_loss += kld_loss(
                 student_logprobs_at_topk.float(), teacher_logprobs.float()
@@ -216,10 +214,6 @@ def save_checkpoint(
         "python_rng_state": random.getstate(),
     }
     torch.save(training_state, os.path.join(checkpoint_dir, "training_state.pt"))
-
-    with open(os.path.join(checkpoint_dir, "checkpoint_info.json"), "w") as f:
-        json.dump({"step": global_step}, f)
-
     print(f"Saved checkpoint at step {global_step} to {checkpoint_dir}")
 
     if push_to_hub and hub_repo:
@@ -235,7 +229,6 @@ def save_checkpoint(
 
 def load_checkpoint(checkpoint_dir, hub_repo=None):
     """Load training state from local checkpoint or HF Hub. Returns (step, state) or (0, None)."""
-    info_path = os.path.join(checkpoint_dir, "checkpoint_info.json")
     state_path = os.path.join(checkpoint_dir, "training_state.pt")
 
     # Try downloading from HF if local files missing
@@ -243,34 +236,23 @@ def load_checkpoint(checkpoint_dir, hub_repo=None):
         try:
             os.makedirs(checkpoint_dir, exist_ok=True)
             hf_hub_download(hub_repo, "training_state.pt", local_dir=checkpoint_dir)
-            hf_hub_download(hub_repo, "checkpoint_info.json", local_dir=checkpoint_dir)
             if master_process:
                 print(f"Downloaded training state from {hub_repo}")
         except Exception as e:
             if master_process:
                 print(f"No training state on HF Hub: {e}")
 
-    if not os.path.exists(info_path) or not os.path.exists(state_path):
+    if not os.path.exists(state_path):
         return 0, None
-
-    with open(info_path) as f:
-        info = json.load(f)
 
     state = torch.load(state_path, map_location="cpu", weights_only=False)
     if master_process:
-        print(f"Found checkpoint at step {info['step']}")
-    return info["step"], state
+        print(f"Found checkpoint at step {state['step']}")
+    return state["step"], state
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Distill pruned FlexOlmo")
-    parser.add_argument(
-        "--importance",
-        "-i",
-        choices=IMPORTANCE_TYPES,
-        required=True,
-        help="Which importance scores were used for pruning",
-    )
     parser.add_argument(
         "--width",
         "-w",
@@ -285,9 +267,6 @@ def parse_args():
         help="Push checkpoints to HuggingFace Hub (default: local only)",
     )
     parser.add_argument(
-        "--debug", action="store_true", help="Debug mode: overfit on 10 batches"
-    )
-    parser.add_argument(
         "--batch-size",
         "-b",
         type=int,
@@ -295,28 +274,9 @@ def parse_args():
         help=f"Batch size (default: {DEFAULT_BATCH_SIZE})",
     )
     parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=4,
-        help="Number of DataLoader workers for prefetching (default: 4)",
-    )
-    parser.add_argument(
-        "--seq-len",
-        type=int,
-        default=4096,
-        help=f"Sequence length (default: {4096})",
-    )
-    parser.add_argument(
-        "--grad-accum-steps",
-        "-g",
-        type=int,
-        default=DEFAULT_GRAD_ACCUM_STEPS,
-        help=f"Gradient accumulation steps (default: {DEFAULT_GRAD_ACCUM_STEPS})",
-    )
-    parser.add_argument(
-        "--no-resume",
+        "--resume",
         action="store_true",
-        help="Start fresh, ignore any existing checkpoints",
+        help="Resume from existing checkpoint if available",
     )
     return parser.parse_args()
 
@@ -324,19 +284,18 @@ def parse_args():
 def main():
     args = parse_args()
     batch_size = args.batch_size
-    grad_accum_steps = args.grad_accum_steps
+    # Derive grad_accum_steps to hit target tokens per step
+    grad_accum_steps = TARGET_TOKENS_PER_STEP // (batch_size * SEQ_LEN * ddp_world_size)
 
-    model_path = f"pruned_models/flex_{args.importance}_{args.width}"
-    checkpoint_dir = f"checkpoints/flex_{args.importance}_{args.width}"
-    hub_repo = f"hbfreed/flex-{args.importance}-{args.width}"
+    model_path = f"pruned_models/flex_math_{args.width}"
+    checkpoint_dir = f"checkpoints/flex_math_{args.width}"
+    hub_repo = f"hbfreed/flex-math-{args.width}"
 
     # Check for existing checkpoint
-    if args.no_resume:
-        resume_step, resume_state = 0, None
-        if master_process:
-            print("Starting fresh (--no-resume specified)")
-    else:
+    if args.resume:
         resume_step, resume_state = load_checkpoint(checkpoint_dir, hub_repo)
+    else:
+        resume_step, resume_state = 0, None
 
     # Load data from HuggingFace (memory-mapped)
     dataset = load_logprobs_dataset()
@@ -360,25 +319,9 @@ def main():
             print(f"Loading student model from {model_path}...")
         student = load_pruned_model(model_path, device=device)
 
-    # Gradient checkpointing trades compute for memory. With grad accumulation,
-    # activations are freed after each micro-batch backward, so not needed.
-    # student.gradient_checkpointing_enable(
-    #     gradient_checkpointing_kwargs={"use_reentrant": False}
-    # )
-
     # Wrap with DDP for multi-GPU training
     if ddp:
         student = DDP(student, device_ids=[ddp_local_rank])
-
-    if master_process:
-        print(f"Using batch size: {batch_size}")
-
-    # Debug mode: overfit on 10 batches
-    if args.debug:
-        if master_process:
-            print("\n*** DEBUG MODE: overfitting on 10 batches ***\n")
-        train_data = train_data.select(range(min(10 * batch_size, len(train_data))))
-        val_data = val_data.select(range(min(batch_size, len(val_data))))
 
     # Create DataLoaders with prefetching
     # Use SkipShuffleSampler for fast resume (skips at sampler level, not iteration level)
@@ -388,8 +331,10 @@ def main():
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        sampler=SkipShuffleSampler(train_dataset, skip=skip_samples, rank=ddp_rank, world_size=ddp_world_size),
-        num_workers=args.num_workers,
+        sampler=SkipShuffleSampler(
+            train_dataset, skip=skip_samples, rank=ddp_rank, world_size=ddp_world_size
+        ),
+        num_workers=8
         pin_memory=True,
         prefetch_factor=2,
         drop_last=True,
@@ -399,7 +344,7 @@ def main():
         LogprobsDataset(val_data),
         batch_size=batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
+        num_workers=8,
         pin_memory=True,
         prefetch_factor=2,
         drop_last=True,
@@ -412,26 +357,16 @@ def main():
     # With DDP, each GPU processes micro_batches_per_epoch / world_size batches
     micro_batches_per_epoch = len(train_loader)
     steps_per_epoch = micro_batches_per_epoch // grad_accum_steps
-    if args.debug:
-        n_epochs_actual = 10  # 10 passes over 10 batches = 100 steps
-        total_steps = steps_per_epoch * n_epochs_actual
-    else:
-        n_epochs_actual = n_epochs
-        total_steps = steps_per_epoch * n_epochs_actual
+    total_steps = steps_per_epoch * n_epochs
     eval_every = max(1, int(total_steps * 0.1))
-    save_every = (
-        max(1, min(500, int(total_steps * 0.5)))
-        if args.debug
-        else max(1, min(1000, int(total_steps * 0.05)))
-    )
+    save_every = max(1, min(1000, int(total_steps * 0.05)))
 
-    tokens_per_step = batch_size * args.seq_len * grad_accum_steps * ddp_world_size
+    tokens_per_step = batch_size * SEQ_LEN * grad_accum_steps * ddp_world_size
     if master_process:
         print(f"Gradient accumulation steps: {grad_accum_steps}")
         print(f"Micro-batches per epoch: {micro_batches_per_epoch}")
         print(f"Optimizer steps per epoch: {steps_per_epoch}")
         print(f"Total optimizer steps: {total_steps}")
-        print(f"Resume step: {resume_step}")
         print(f"Tokens per optimizer step: {tokens_per_step:,}")
         print(f"Eval every: {eval_every} steps")
         print(f"Save every: {save_every} steps")
@@ -465,23 +400,22 @@ def main():
     if master_process:
         wandb.init(
             project=wandb_project,
-            mode="offline" if args.debug else "online",
+            name=hub_repo,
+            mode="online",
             config={
-                "importance": args.importance,
                 "width": args.width,
                 "model_path": model_path,
-                "seq_len": args.seq_len,
+                "seq_len": SEQ_LEN,
                 "batch_size": batch_size,
                 "grad_accum_steps": grad_accum_steps,
                 "effective_batch_size": batch_size * grad_accum_steps * ddp_world_size,
                 "tokens_per_step": tokens_per_step,
                 "steps_per_epoch": steps_per_epoch,
-                "n_epochs": n_epochs_actual,
+                "n_epochs": n_epochs,
                 "total_steps": total_steps,
                 "resume_step": resume_step,
                 "lr_start": 2e-4,
                 "lr_end": 4.5e-7,
-                "debug": args.debug,
                 "ddp_world_size": ddp_world_size,
             },
             resume="allow",
@@ -502,11 +436,11 @@ def main():
     accumulated_tokens = 0
     step_start_time = time.time()
 
-    for epoch in range(n_epochs_actual):
+    for epoch in range(n_epochs):
         pbar = tqdm(
             train_loader,
             total=len(train_loader),
-            desc=f"Epoch {epoch + 1}/{n_epochs_actual}",
+            desc=f"Epoch {epoch + 1}/{n_epochs}",
             disable=not master_process,
         )
         for batch in pbar:
@@ -517,14 +451,11 @@ def main():
                 dim=-1,
             )
 
-            pad_mask = batch["pad_mask"]
             student_logprobs_at_topk = student_logprobs.gather(
                 -1, batch["teacher_indices"]
             )
-            student_logprobs_at_topk = student_logprobs_at_topk[pad_mask]
-            teacher_logits = batch["teacher_logits"][pad_mask]
-            teacher_logprobs = F.log_softmax(teacher_logits.float(), dim=-1).to(
-                teacher_logits.dtype
+            teacher_logprobs = F.log_softmax(batch["teacher_logits"].float(), dim=-1).to(
+                batch["teacher_logits"].dtype
             )
 
             # Scale loss for gradient accumulation
@@ -533,12 +464,14 @@ def main():
             scaled_loss.backward()
 
             accumulated_loss += loss.item()
-            accumulated_tokens += pad_mask.sum().item()
+            accumulated_tokens += batch["input_ids"].numel()
             micro_step += 1
 
             # Only update weights after accumulating enough gradients
             if micro_step % grad_accum_steps == 0:
-                grad_norm = torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    trainable_params, max_norm=1.0
+                )
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
@@ -568,7 +501,6 @@ def main():
                         scheduler,
                         global_step,
                         checkpoint_dir,
-                        args.importance,
                         args.width,
                         args.push_to_hub,
                         hub_repo,
