@@ -167,63 +167,6 @@ def load_pruned_model(save_path, device="cuda"):
     return model.to(device)
 
 
-def convert_old_format_to_new(save_path):
-    """Convert old pruning_config.json format to new HF-compatible config.json format."""
-    import json
-    import shutil
-    from pathlib import Path
-
-    save_path = Path(save_path)
-    old_config_path = save_path / "pruning_config.json"
-    new_config_path = save_path / "config.json"
-
-    if not old_config_path.exists():
-        print(f"No old format config found at {old_config_path}")
-        return
-
-    if new_config_path.exists():
-        print(f"New format config already exists at {new_config_path}")
-        return
-
-    # Load old metadata
-    with open(old_config_path) as f:
-        old_metadata = json.load(f)
-
-    expert_1_width = old_metadata["expert_1_width"]
-    importance_type = old_metadata.get("importance_type", "unknown")
-    base_model = old_metadata.get("base_model", MODEL)
-
-    # Get base model config
-    from transformers import AutoConfig
-    base_config = AutoConfig.from_pretrained(base_model)
-    config_dict = base_config.to_dict()
-
-    # Add pruned model specifics
-    config_dict["model_type"] = "pruned_flex_olmo"
-    config_dict["expert_1_intermediate_size"] = expert_1_width
-    config_dict["auto_map"] = {
-        "AutoConfig": "configuration_pruned_flex_olmo.PrunedFlexOlmoConfig",
-        "AutoModelForCausalLM": "modeling_pruned_flex_olmo.PrunedFlexOlmoForCausalLM",
-    }
-    config_dict["_pruning_metadata"] = {
-        "base_model": base_model,
-        "importance_type": importance_type,
-    }
-
-    # Save new config
-    with open(new_config_path, "w") as f:
-        json.dump(config_dict, f, indent=2)
-
-    # Copy modeling files
-    repo_root = Path(__file__).parent
-    for filename in ["modeling_pruned_flex_olmo.py", "configuration_pruned_flex_olmo.py"]:
-        src = repo_root / filename
-        if src.exists():
-            shutil.copy(src, save_path / filename)
-
-    print(f"Converted {save_path} to new HF-compatible format")
-
-
 def prune_model(expert_1_width, importance_path):
     """Load model, split experts, and prune expert 1."""
     print(f"Loading importance scores from {importance_path}")
