@@ -8,6 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+.python-version
 
 # uv lockfile
 uv.lock
@@ -32,9 +33,12 @@ uv.lock
 pruned_models/
 checkpoints/
 results/
+importance_scores_tensors/
 wandb/
 
-# wandb plotting script and outputs
-plot_wandb_losses.py
-wandb_history_*.csv
+# wandb exports and plotting
+*.csv
 *_loss_comparison.png
+
+# misc caches
+*.db
