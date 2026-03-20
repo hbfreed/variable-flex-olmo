@@ -334,7 +334,7 @@ def main():
         sampler=SkipShuffleSampler(
             train_dataset, skip=skip_samples, rank=ddp_rank, world_size=ddp_world_size
         ),
-        num_workers=8
+        num_workers=8,
         pin_memory=True,
         prefetch_factor=2,
         drop_last=True,
@@ -372,6 +372,12 @@ def main():
         print(f"Save every: {save_every} steps")
         if ddp:
             print(f"DDP: {ddp_world_size} GPUs")
+
+    # Unfreeze expert 1 (load_pruned_model freezes everything)
+    raw = student.module if ddp else student
+    for layer in raw.model.layers:
+        for param in layer.mlp.experts[1].parameters():
+            param.requires_grad = True
 
     # Only optimize trainable params (expert 1)
     trainable_params = [p for p in student.parameters() if p.requires_grad]
@@ -501,6 +507,7 @@ def main():
                         scheduler,
                         global_step,
                         checkpoint_dir,
+                        "math",
                         args.width,
                         args.push_to_hub,
                         hub_repo,
@@ -528,7 +535,7 @@ def main():
             scheduler,
             global_step,
             checkpoint_dir,
-            args.importance,
+            "math",
             args.width,
             args.push_to_hub,
             hub_repo,
