@@ -254,7 +254,11 @@ def create_topology(
     expert_size_blocks = expert_size_blocks.to(device)
     expert_token_blocks = expert_token_blocks.to(device)
 
-    repeated_sizes = torch.repeat_interleave(expert_size_blocks, expert_token_blocks)
+    # Passing output_size makes repeat_interleave sync-free (otherwise it syncs to
+    # discover the output length before allocating). block_rows == sum(expert_token_blocks).
+    repeated_sizes = torch.repeat_interleave(
+        expert_size_blocks, expert_token_blocks, output_size=block_rows
+    )
     repeated_sizes = repeated_sizes.to(device)  # Force device
 
     offsets = torch.cat([torch.zeros(1, dtype=repeated_sizes.dtype, device=device), repeated_sizes.cumsum(0)])

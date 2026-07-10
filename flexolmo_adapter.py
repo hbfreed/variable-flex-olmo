@@ -24,7 +24,6 @@ class FlexOlmoAdapter:
         self.num_experts = config.num_experts
         self.num_active_experts = config.num_experts_per_tok
         self.sort_end_bit = max(int(math.ceil(math.log2(self.num_experts))), 1)
-        self.transpose_sort_end_bit = self.sort_end_bit
 
         # for uniform experts (FlexOlmo), all same size
         ffn = config.intermediate_size
@@ -34,6 +33,15 @@ class FlexOlmoAdapter:
         # precompute block info
         block_size = 128
         self.block_size = block_size
+
+        # The transpose sort orders column-BLOCK indices, whose range is the
+        # number of column-blocks (total_expert_width / block_size), NOT
+        # num_experts. Sizing this to num_experts drops high bits whenever an
+        # expert spans more than one block (always, since intermediate_size >>
+        # 128), corrupting the sparse transpose and thus the expert weight
+        # gradients. Matches upstream megablocks dmoe.py.
+        max_column_index = self.total_expert_width // block_size
+        self.transpose_sort_end_bit = max(int(math.ceil(math.log2(max_column_index))), 1)
         self.expert_size_blocks = torch.tensor(
             [ffn // block_size] * self.num_experts, dtype=torch.int32
         )
