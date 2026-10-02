@@ -13,8 +13,9 @@ Pruned models trained with ~228M tokens of distillation from [Flex-math-2x7B-1T]
 | [flex-math-8192](https://huggingface.co/hbfreed/flex-math-8192) | 10.5B | 3.2B | 8192 (74%) | 70.1 | 31.3 | 50.7 |
 | [flex-math-5504](https://huggingface.co/hbfreed/flex-math-5504) | 9.5B | 2.2B | 5504 (50%) | 66.6 | 26.8 | 46.7 |
 | [flex-math-2048](https://huggingface.co/hbfreed/flex-math-2048) | 8.1B | 0.8B | 2048 (19%) | 44.3 | 13.9 | 29.1 |
+| flex-math-2048 (pruned only, no distillation) | 8.1B | 0.8B | 2048 (19%) | 13.1 | 3.3 | 8.2 |
 
-The 8192 model matches the full-sized expert. Even the 2048 model (0.8B expert) scores 3.6x the no-expert baseline.
+The 8192 model matches the full-sized expert. Even the 2048 model (0.8B expert) scores 3.6x the no-expert baseline. Without distillation, pruning alone basically breaks the model (13% GSM8K) — distillation is doing the heavy lifting.
 
 ## FlexOlmo Expert Mapping
 
@@ -114,3 +115,24 @@ uv run lm_eval --model hf \
 ```
 
 For multi-GPU, add `parallelize=True` to model_args and remove `--device`.
+
+To eval a pre-distillation (pruned-only) checkpoint, use an earlier HuggingFace revision:
+
+```bash
+# Download pruned-only weights from first commit, pair with current config
+python -c "
+from huggingface_hub import hf_hub_download
+for f in ['model.safetensors']:
+    hf_hub_download('hbfreed/flex-math-2048', f, revision='d84212b90f49', local_dir='pruned_models/flex_math_2048_pruned_only')
+for f in ['config.json', 'modeling_pruned_flex_olmo.py', 'configuration_pruned_flex_olmo.py']:
+    hf_hub_download('hbfreed/flex-math-2048', f, local_dir='pruned_models/flex_math_2048_pruned_only')
+"
+
+# Then eval as usual, pointing at the local dir
+uv run lm_eval --model hf \
+    --model_args "pretrained=pruned_models/flex_math_2048_pruned_only,tokenizer=allenai/dolma2-tokenizer,trust_remote_code=True,dtype=bfloat16,attn_implementation=flash_attention_2" \
+    --tasks gsm8k_cot,minerva_math \
+    --batch_size 4 \
+    --device cuda:0 \
+    --output_path ./results/flex-math-2048-pruned-only
+```
